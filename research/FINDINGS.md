@@ -118,9 +118,9 @@ and nothing dated replaced it.
 | line | when | state | heading |
 |---|---|---|---|
 | 584 | — | settled | snapshot / restore —  faithful; the control that condemned it was wrong |
-| 859 | 2026-08-13 |  | Independent corroboration from `daniel5151/clicky` (2026-08-13) |
-| 961 | 2026-08-31 |  | Caveat on the interrupt-wake fix (2026-08-31) — it stops the machine idling |
-| 993 | 2026-09-24 |  | #6 read off the hardware — 2026-09-24 |
+| 861 | 2026-08-13 |  | Independent corroboration from `daniel5151/clicky` (2026-08-13) |
+| 963 | 2026-08-31 |  | Caveat on the interrupt-wake fix (2026-08-31) — it stops the machine idling |
+| 995 | 2026-09-24 |  | #6 read off the hardware — 2026-09-24 |
 
 ### [`05-the-chip-inventory.md`](05-the-chip-inventory.md)
 
