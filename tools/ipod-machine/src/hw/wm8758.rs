@@ -139,6 +139,9 @@ pub struct Wm8758 {
     pub malformed: Capped<(u8, [u8; 4])>,
     /// Writes to `R0`, which the part defines as a software reset.
     pub resets: u64,
+    /// Bit `n` is set when `Rn` has been written since power-on or the last reset. Only
+    /// [`Wm8758::output_gain`] reads it, to tell a volume the firmware chose from one it never set.
+    touched: u64,
 }
 
 impl Default for Wm8758 {
@@ -177,6 +180,7 @@ impl Wm8758 {
             out_of_map: 0,
             malformed: Capped::new(32),
             resets: 0,
+            touched: 0,
         }
     }
 
@@ -214,9 +218,11 @@ impl Wm8758 {
             return;
         }
         self.regs[reg as usize] = val;
+        self.touched |= 1 << reg;
         if reg == Self::RESET {
             self.resets += 1;
             self.regs = [0; Self::N_REGS];
+            self.touched = 0;
         }
     }
 
@@ -287,6 +293,44 @@ impl Wm8758 {
     pub fn dac_enabled(&self) -> (bool, bool) {
         let r3 = self.regs[0x03];
         (r3 & 1 != 0, r3 & 2 != 0)
+    }
+
+    /// Linear gain from the DAC input to the headphone output, `(left, right)`, from the registers
+    /// as written: `SOFTMUTE` (R10 bit 6), the DAC enable and volume (R3 bits 0 and 1, R11 and R12)
+    /// and the `OUT1` volume and mute (R52 and R53). A channel whose DAC is off, or whose volume
+    /// field is zero, is 0.0.
+    ///
+    /// A volume register that was never written (or not since R0) reads as the part's reset value,
+    /// 0 dB on the DAC and `OUT1`, and not as the zero this file holds, so a firmware that leaves
+    /// one alone is not silenced by the placeholder.
+    ///
+    /// Not modelled: the volume-update latches (a value takes effect when written, not when bit 8
+    /// is set), zero-cross, `OUT2` (R54 and R55), the output-stage enables and the mixers, the EQ
+    /// and the 3D stage.
+    pub fn output_gain(&self) -> (f32, f32) {
+        let held = |reg: u8, reset: u16| {
+            if self.touched >> reg & 1 != 0 {
+                self.regs[reg as usize]
+            } else {
+                reset
+            }
+        };
+        if self.regs[0x0a] & 0x40 != 0 {
+            return (0.0, 0.0);
+        }
+        let (dac_l, dac_r) = self.dac_enabled();
+        let channel = |on: bool, dac: u16, out: u16| {
+            let dac = dac & 0xff;
+            if !on || dac == 0 || out & 0x40 != 0 {
+                return 0.0;
+            }
+            let db = (f32::from(dac) - 255.0) * 0.5 + f32::from(out & 0x3f) - 57.0;
+            10f32.powf(db / 20.0)
+        };
+        (
+            channel(dac_l, held(0x0b, 0x0ff), held(0x34, 0x039)),
+            channel(dac_r, held(0x0c, 0x0ff), held(0x35, 0x039)),
+        )
     }
 
     pub fn name(reg: u8) -> Option<&'static str> {
@@ -755,6 +799,62 @@ mod tests {
         put(&mut c, 0x03, 0x002);
         assert_eq!(c.dac_enabled(), (false, true));
     }
+    fn db(g: f32) -> f32 {
+        20.0 * g.log10()
+    }
+
+    #[test]
+    fn output_gain_follows_the_rockbox_volume_writes() {
+        let mut c = Wm8758::new();
+        put(&mut c, 0x03, 0x00f);
+        // 80% in the sound layer: DAC 255, PGA 39, so -18 dB.
+        put(&mut c, 0x0b, 0x0ff);
+        put(&mut c, 0x0c, 0x1ff);
+        put(&mut c, 0x34, 0x0a7);
+        put(&mut c, 0x35, 0x1a7);
+        let (l, r) = c.output_gain();
+        assert!(
+            (db(l) + 18.0).abs() < 1e-3 && (db(r) + 18.0).abs() < 1e-3,
+            "{l} {r}"
+        );
+        // 10%: DAC 207 (-24 dB), PGA 0 (-57 dB).
+        put(&mut c, 0x0b, 0x0cf);
+        put(&mut c, 0x0c, 0x1cf);
+        put(&mut c, 0x34, 0x080);
+        put(&mut c, 0x35, 0x180);
+        assert!((db(c.output_gain().0) + 81.0).abs() < 1e-3);
+        // 0 dB on both stages.
+        put(&mut c, 0x0b, 0x0ff);
+        put(&mut c, 0x34, 0x0b9);
+        assert!((c.output_gain().0 - 1.0).abs() < 1e-6);
+        // The channels are separate: the right DAC is still at -24 dB, its PGA now +6 dB.
+        put(&mut c, 0x35, 0x1bf);
+        assert!((db(c.output_gain().1) + 18.0).abs() < 1e-3);
+        assert!((c.output_gain().0 - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn output_gain_is_zero_when_muted_or_the_dac_is_off() {
+        let mut c = Wm8758::new();
+        put(&mut c, 0x03, 0x00f);
+        assert_eq!(c.output_gain(), (1.0, 1.0), "reset volumes are 0 dB");
+        put(&mut c, 0x0a, 0x040);
+        assert_eq!(c.output_gain(), (0.0, 0.0), "SOFTMUTE");
+        put(&mut c, 0x0a, 0x008);
+        assert_eq!(c.output_gain(), (1.0, 1.0), "unmuted by the overwrite");
+        put(&mut c, 0x0b, 0x000);
+        assert_eq!(c.output_gain().0, 0.0, "DAC volume 0 is digital mute");
+        assert_eq!(c.output_gain().1, 1.0);
+        put(&mut c, 0x35, 0x140);
+        assert_eq!(c.output_gain(), (0.0, 0.0), "OUT1 mute bit on the right");
+        put(&mut c, 0x35, 0x139);
+        put(&mut c, 0x0b, 0x0ff);
+        put(&mut c, 0x03, 0x002);
+        assert_eq!(c.output_gain(), (0.0, 1.0), "left DAC off");
+        put(&mut c, 0x00, 0);
+        assert_eq!(c.output_gain(), (0.0, 0.0), "reset: both DACs off");
+    }
+
     #[test]
     fn r61_is_a_register_and_r58_to_r60_are_not() {
         let mut c = Wm8758::new();
