@@ -704,10 +704,14 @@ pub struct Memory {
     /// forget to pass it. It costs one struct on a run that never addresses `0x1a`, and its
     /// `report()` is empty then.
     pub wm8758: Wm8758,
-    /// The I2S transmit sink behind the codec: PCM from `IISFIFO_WR` to a WAV file. `None` unless
-    /// a run asks (`trace --audio-wav=`), and then the FIFO port is plain backing store and nothing
-    /// below changes. See [`Memory::enable_audio`].
+    /// The I2S transmit sink behind the codec: PCM from `IISFIFO_WR` to a WAV file, paced at the
+    /// codec's decoded rate. `None` unless a run asks (`trace --audio-wav=`), and then the FIFO
+    /// port is plain backing store and nothing below changes. See [`Memory::enable_audio`].
     pub audio: Option<Audio>,
+    /// Deliver sources whose `CPU_INT_PRIORITY` bit is set as FIQ instead of IRQ. Off, the
+    /// register is plain storage and everything is an IRQ, as it was before this existed; on only
+    /// with [`Memory::enable_audio`], whose DMA completion Rockbox routes that way.
+    pub fiq_routing: bool,
     /// The external memory bus controller, when modelled rather than answered with `--rdval`.
     pub xmb: Option<Xmb>,
     /// The click wheel, when modelled rather than answered with zero.
@@ -1948,11 +1952,14 @@ impl Memory {
     /// Turn on the I2S sink: PCM stored to `IISFIFO_WR` is collected and written to `path` as WAV
     /// by [`Audio::finish`].
     ///
-    /// Two things change, both only from here. The FIFO port stops being backing store.
+    /// Three things change, all of them only from here. The FIFO port stops being backing store.
     /// `IISFIFO_CFG` reads with its transmit free count at 16 (empty), which is what Rockbox's
     /// `dma_tx_stop` spins for; the sink consumes at store time, so the FIFO is always empty.
+    /// And [`Memory::fiq_routing`] comes on. Bypass ledger #21; retire it when a retail boot with
+    /// the routing on matches one with it off.
     pub fn enable_audio(&mut self, path: impl Into<std::path::PathBuf>, mclk_hz: f64) {
         self.audio = Some(Audio::new(path, mclk_hz));
+        self.fiq_routing = true;
         if !self.read_or_masks.iter().any(|&(at, _)| at == IISFIFO_CFG) {
             self.read_or_masks.push((IISFIFO_CFG, IIS_TX_FREE_EMPTY));
         }
@@ -4581,6 +4588,8 @@ pub struct Machine {
     /// controller never asserting at all.
     pub irqs_asserted: u64,
     pub irqs_taken: u64,
+    /// FIQs the CPU took; see [`Memory::fiq_routing`].
+    pub fiqs_taken: u64,
     /// Sampled PC histogram, bucketed by 16 bytes. `None` disables sampling entirely.
     pub profile: Option<HashMap<u32, u64>>,
     /// Restrict sampling to `[from, to)` instructions. A whole-run profile of this boot is 57%
@@ -4751,6 +4760,7 @@ impl Machine {
             pmu: None,
             wm8758: Wm8758::new(),
             audio: None,
+            fiq_routing: false,
             xmb: None,
             clickwheel: None,
             piezo: Piezo::new(Piezo::BASE),
@@ -4973,6 +4983,7 @@ impl Machine {
             timer_next: [0; 2],
             irqs_asserted: 0,
             irqs_taken: 0,
+            fiqs_taken: 0,
             profile: None,
             profile_window: None,
             novelty: None,
@@ -7313,7 +7324,8 @@ pub fn install_game_stubs(&mut self, exe_stem: &str, o: GameStubs) -> bool {
         // took a quarter of the machine. Everything else keeps the old behaviour.
         let done = DMA_STATUS_INTR | (cmd & DMA_SIZE_MASK);
         if to_per && (per & !0xf) == IIS_FIFO_WR {
-            let usec = ((len as u64 / I2S_BYTES_PER_FRAME) * 1_000_000 / I2S_FRAMES_PER_SEC) as u32;
+            let rate = self.mem.audio_rate().map_or(I2S_FRAMES_PER_SEC, u64::from);
+            let usec = ((len as u64 / I2S_BYTES_PER_FRAME) * 1_000_000 / rate) as u32;
             self.mem
                 .pp_dma_due
                 .insert(base, self.mem.usec.saturating_add(usec));
@@ -7427,7 +7439,20 @@ pub fn install_game_stubs(&mut self, exe_stem: &str, o: GameStubs) -> bool {
             .write32(CPU_INT_STAT, (pending & enabled) | hi_aggregate);
         self.mem.write32(HI_INT_STAT, pending_hi);
         self.mem.write32(CPU_HI_INT_STAT, pending_hi & enabled_hi);
-        if pending & enabled != 0 || pending_hi & enabled_hi != 0 {
+        // Level, like the IRQ: a FIQ masked in the CPSR stays asserted and is retried next tick.
+        let prio = if self.mem.fiq_routing {
+            self.mem.read32(CPU_INT_PRIORITY) & FIQ_ROUTED
+        } else {
+            0
+        };
+        if pending & enabled & prio != 0 {
+            self.irqs_asserted += 1;
+            if self.cpu.fiq() {
+                self.fiqs_taken += 1;
+            }
+        }
+        let irq_lines = pending & enabled & !prio;
+        if irq_lines != 0 || pending_hi & enabled_hi != 0 {
             self.irqs_asserted += 1;
             if self.cpu.irq() {
                 self.irqs_taken += 1;
@@ -7436,7 +7461,7 @@ pub fn install_game_stubs(&mut self, exe_stem: &str, o: GameStubs) -> bool {
                 // acknowledgement, so nothing is cleared here — the two real acks are a read of
                 // the primary status register (`read8_inner`) and a write of IDE0_CFG's clear bits
                 // (`write8_inner`), and both drop the line.
-                if pending & enabled & (1 << IDE_IRQ) != 0 {
+                if irq_lines & (1 << IDE_IRQ) != 0 {
                     self.mem.ide_irq_delivered += 1;
                     self.mem.note_ide_event(IDE_EV_DELIVERED);
                 }
@@ -10369,6 +10394,12 @@ pub const SDRAM_LEN: u32 = 0x0400_0000;
 pub const PROC_ID: u32 = 0x6000_0000;
 
 pub const CPU_CTRL: u32 = 0x6000_7000;
+/// A set bit routes that source to the CPU as FIQ. Rockbox's `pp5020.h`.
+pub const CPU_INT_PRIORITY: u32 = 0x6000_402c;
+/// The sources `CPU_INT_PRIORITY` can route to FIQ here: the audio DMA controller, IRQ 26. RetailOS
+/// also sets the bits of IRQ 27 and the aggregate, and with those routed its boot never lights the
+/// panel (an FIQ storm on the second DMA controller's pending line).
+pub const FIQ_ROUTED: u32 = 1 << 26;
 
 /// Software-raised interrupts, low bank and high. Rockbox names all six registers and uses none of
 /// them; RetailOS uses them as its deferred-work mechanism, which is why they matter here. Its DMA
@@ -10472,7 +10503,7 @@ pub const DMA_SIZE_MASK: u32 = 0xfffc;
 /// `IISFIFO_WR`, the I2S transmit FIFO — Rockbox `pp5020.h`, and `research/15`'s register table
 /// already names its two neighbours `IISCONFIG` (`0x70002800`) and `IISFIFO_CFG` (`0x7000280c`).
 /// This is the one DMA destination on the part that consumes at a clock of its own.
-pub const IIS_FIFO_WR: u32 = 0x7000_2840;
+pub const IIS_FIFO_WR: u32 = IISFIFO_WR;
 /// One 32-bit FIFO word is one stereo frame: two 16-bit samples, left then right.
 pub const I2S_BYTES_PER_FRAME: u64 = 4;
 /// 44.1 kHz. Not read off the part — the codec model is a recorder and the I2S clock dividers are

@@ -1222,7 +1222,7 @@ fn main() {
                 .and_then(|v| v.parse::<f64>().ok())
                 .unwrap_or(ipod_machine::Wm8758::DEFAULT_MCLK_HZ);
             m.mem.enable_audio(path, mclk);
-            println!("  audio: I2S sink -> {path} (codec MCLK {mclk} Hz)");
+            println!("  audio: I2S sink -> {path} (codec MCLK {mclk} Hz), FIQ routing on");
         }
         if audio_wav.is_some()
             || args.iter().any(|a| a == "--i2c")
@@ -2381,6 +2381,7 @@ fn main() {
             for line in a.report() {
                 println!("{line}");
             }
+            println!("  fiqs taken: {}", m.fiqs_taken);
         }
         // Every number here is checkable against something. `commands` should equal the transmits
         // RetailOS's `0x00283fa0` starts; `data reads` should equal the loads at `0x00281364` plus

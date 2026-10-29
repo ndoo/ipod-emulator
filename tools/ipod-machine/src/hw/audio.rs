@@ -1,7 +1,8 @@
 //! The I2S transmit path, as a sink: what the PP5022 sends the WM8758, written out as WAV.
 //!
 //! Off by default. `Memory::audio` is `None` until a run asks for it (`trace --audio-wav=FILE`),
-//! and with it `None` nothing here is reached: the FIFO port stays plain backing store.
+//! and with it `None` nothing here is reached: the FIFO port stays plain backing store, the DMA
+//! pacing keeps its fixed rate, and interrupts are all delivered as IRQ.
 //!
 //! What is modelled:
 //!
@@ -17,8 +18,8 @@
 //!   written again). A change of rate starts a new WAV file; one file has one rate.
 //!
 //! What is not modelled: DAC volume, soft mute, the EQ and the 3D stage, so the file is the PCM
-//! at the codec's input, not at its output. The FIFO has no depth here: a word is consumed when it
-//! is stored.
+//! at the codec's input, not at its output. The FIFO has no depth here; the DMA completion pacing
+//! in `run_pp_dma` stands in for it.
 
 use crate::hw::wm8758::Wm8758;
 use std::path::PathBuf;
