@@ -15,6 +15,7 @@ members = [
     "tools/docgen",       # research/FINDINGS.md, generated from research/ and kept honest by a test
     "tools/eapp-inspect",# static inspection of eApp binaries
     "tools/ipod-gui",    # the window: a drawn iPod over the emulator
+    "tools/ipod-audio",  # host audio output for the window: ring buffer, resampler, cpal device
     "tools/ipg-player",  # one .ipg title in a window — the model with a toolkit on top, never inside
 ]
 

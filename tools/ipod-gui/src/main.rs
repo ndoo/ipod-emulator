@@ -12931,7 +12931,7 @@ pub(crate) mod tests {
         let wiring = wire(
             &w,
             settings.clone(),
-            args::Machine { cold: true, clock: Some(5), cores: Some(true), charger: true },
+            args::Machine { cold: true, clock: Some(5), cores: Some(true), charger: true, audio_live: false },
             Rc::new(drops::Shell::Native),
         );
         w.invoke_start_device(0);

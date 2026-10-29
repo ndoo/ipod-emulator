@@ -148,6 +148,12 @@ pub struct Machine {
     /// A property of what the iPod is plugged into, which is neither the device nor the experiment
     /// — and it is the only configuration in which there is a charging screen to return to.
     pub charger: bool,
+    /// `--audio-live`: play what the firmware sends the codec on the host's default audio output.
+    ///
+    /// A property of the host the launch runs on, like the clock, and not of the iPod. Off, the
+    /// machine does what it did before this existed: the I2S FIFO port is backing store, the DMA
+    /// is paced at 44.1 kHz and no interrupt is routed as FIQ.
+    pub audio_live: bool,
 }
 
 impl Machine {
@@ -175,6 +181,7 @@ impl Machine {
             cfg.one_core = !two;
         }
         cfg.charger |= self.charger;
+        cfg.audio_live |= self.audio_live;
         if let Some(n) = self.clock {
             cfg.clock = n;
             cfg.click_gap = ipod_machine::pace::wheel_click_gap(n);
@@ -261,6 +268,7 @@ pub const FLAGS: &[&str] = &[
     "--second-core",
     "--no-second-core",
     "--charger",
+    "--audio-live",
     // **The sixth, and it configures no machine.** It says this launch may be driven by something
     // that is not a person — which is a property of the process, so it rides beside [`Machine`]
     // on both verbs that start one rather than inside it.
@@ -366,6 +374,13 @@ And these open the window as usual, and configure the machine it starts:
                           drops five wheel frames in six and puts bypass #7 back
   --charger               plug the mains in — the only configuration in which there is a
                           charging screen to return to
+  --audio-live            play the codec's output on the default audio device: macOS and
+                          Windows only. Applies the codec's mute and volume registers, and
+                          resamples to the device's rate. If the machine is slower than real
+                          time the gaps are silence; if faster it is held to real time while
+                          audio is playing. Turns on the I2S model, which routes the DMA
+                          interrupt as FIQ (bypass ledger #21). Without it nothing is played
+                          and the machine is as before
 
 And these name a drive and a socket instead of configuring a library device:
 
@@ -531,6 +546,9 @@ pub fn parse(args: &[String]) -> Cli {
         } else if a == "--charger" {
             machine.charger = true;
             asked_for_machine = true;
+        } else if a == "--audio-live" {
+            machine.audio_live = true;
+            asked_for_machine = true;
         } else if let Some(n) = a.strip_prefix("--clock=") {
             // **Zero is refused rather than clamped.** `emu::build` does `cfg.clock.max(1)`, so
             // `--clock=0` would silently run the part at one instruction per simulated microsecond
@@ -580,7 +598,7 @@ pub fn parse(args: &[String]) -> Cli {
             ))
         }
         Some(Cli::CheckImages { .. }) if asked_for_machine => Cli::Refused(
-            "--cold, --clock=, --second-core and --charger configure a machine, and \
+            "--cold, --clock=, --second-core, --charger and --audio-live configure a machine, and \
              --check-images starts none: it parses two files and exits."
                 .into(),
         ),
@@ -594,7 +612,7 @@ pub fn parse(args: &[String]) -> Cli {
         // …and a machine flag beside a verb that starts nothing is an unread flag, which is the
         // whole defect this file exists to remove.
         Some(v) if asked_for_machine => Cli::Refused(format!(
-            "--cold, --clock=, --second-core and --charger configure the machine the window \
+            "--cold, --clock=, --second-core, --charger and --audio-live configure the machine the window \
              starts, and `{}` opens no window.",
             name_of(&v)
         )),
@@ -1035,11 +1053,12 @@ mod tests {
         );
         assert_eq!(win("--charger"), Machine { charger: true, ..Machine::default() });
         assert_eq!(win("--clock=5"), Machine { clock: Some(5), ..Machine::default() });
+        assert_eq!(win("--audio-live"), Machine { audio_live: true, ..Machine::default() });
         // …and together, because they are not exclusive and a line with two on it is the normal
         // shape of a measurement.
         assert_eq!(
             win("--cold --clock=5 --second-core --charger"),
-            Machine { cold: true, clock: Some(5), cores: Some(true), charger: true }
+            Machine { cold: true, clock: Some(5), cores: Some(true), charger: true, audio_live: false }
         );
 
         // **On the config, and nothing else on it moves.** `apply` writes four axes; a fifth would
@@ -1062,9 +1081,11 @@ mod tests {
         assert_eq!(cfg.click_gap, 300_000, "nor the gap that goes with it");
         assert!(cfg.retune, "a flag nobody typed turned the window's calibration off");
         // Two cores is the default, so "nothing asked for" is `!one_core`.
-        assert!(!cfg.cold && !cfg.one_core && !cfg.charger);
+        assert!(!cfg.cold && !cfg.one_core && !cfg.charger && !cfg.audio_live);
         win("--cold --clock=5 --second-core --charger").apply(&mut cfg);
-        assert!(cfg.cold && !cfg.one_core && cfg.charger);
+        assert!(cfg.cold && !cfg.one_core && cfg.charger && !cfg.audio_live);
+        win("--audio-live").apply(&mut cfg);
+        assert!(cfg.audio_live, "--audio-live did not reach the config");
         assert_eq!(cfg.clock, 5);
         // **The half that would have been silent.** A `--clock=5` leaving 300 000 behind delivers
         // one detent per 60 ms of the iPod's own time — fifteen times slower than a thumb — and

@@ -1,0 +1,17 @@
+[package]
+name = "ipod-audio"
+version.workspace = true
+edition = "2021"
+description = "Host audio output for the emulator window: a ring buffer between the machine thread and the device callback, resampling to the device rate, and the cpal device"
+
+[dependencies]
+ipod-machine = { path = "../ipod-machine" }
+rtrb = "0.3"
+
+# macOS and Windows only. cpal's Linux backend links ALSA and needs libasound2-dev and pkg-config at
+# build time, which the Linux build of the window does not otherwise ask for.
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+cpal = { version = "0.18", default-features = false }
+
+[dev-dependencies]
+arm7tdmi = { path = "../arm7tdmi" }
