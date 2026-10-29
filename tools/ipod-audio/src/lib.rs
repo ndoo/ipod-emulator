@@ -30,7 +30,7 @@
 mod device;
 mod resample;
 
-pub use device::{open, Device};
+pub use device::{open, Device, AVAILABLE};
 pub use resample::Resampler;
 
 use rtrb::{Consumer, Producer, RingBuffer};

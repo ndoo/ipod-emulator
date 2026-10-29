@@ -16,6 +16,9 @@ type Stream = cpal::Stream;
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 type Stream = ();
 
+/// Whether this build can open an output device: macOS and Windows.
+pub const AVAILABLE: bool = cfg!(any(target_os = "macos", target_os = "windows"));
+
 /// Open the default output device at its default configuration and return it with the feeder for
 /// its ring.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
