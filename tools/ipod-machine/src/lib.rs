@@ -42,6 +42,8 @@ pub use hw::mailbox::{Xmb, Mbx};
 pub use hw::flash::{Nor, NorOp};
 pub use hw::pmu::{Pcf50605};
 pub use hw::wm8758::Wm8758;
+pub use hw::audio::Audio;
+use hw::audio::{IISCONFIG, IISFIFO_CFG, IISFIFO_WR, IIS_BLOCK, IIS_BLOCK_LEN, IIS_TX_FREE_EMPTY};
 pub use hw::ata::{Ata, PpDmaCtl};
 pub use hw::cop::{Core};
 pub use hw::video::{Bcm, BcmOp};
@@ -702,6 +704,10 @@ pub struct Memory {
     /// forget to pass it. It costs one struct on a run that never addresses `0x1a`, and its
     /// `report()` is empty then.
     pub wm8758: Wm8758,
+    /// The I2S transmit sink behind the codec: PCM from `IISFIFO_WR` to a WAV file. `None` unless
+    /// a run asks (`trace --audio-wav=`), and then the FIFO port is plain backing store and nothing
+    /// below changes. See [`Memory::enable_audio`].
+    pub audio: Option<Audio>,
     /// The external memory bus controller, when modelled rather than answered with `--rdval`.
     pub xmb: Option<Xmb>,
     /// The click wheel, when modelled rather than answered with zero.
@@ -1859,6 +1865,10 @@ impl Memory {
             })
             || self.ata.as_ref().is_some_and(|(b, _)| hits(*b, 0x410))
             || self.i2c_base.is_some_and(|b| hits(b, 0x40))
+            // The I2S block: the FIFO port, which the word hoist would otherwise bypass. The
+            // `IISFIFO_CFG` read mask already disqualifies the page; this keeps that from being
+            // the only thing that does.
+            || (self.audio.is_some() && hits(IIS_BLOCK, IIS_BLOCK_LEN))
             // The click wheel's four registers sit at +0x100..+0x140 of the same block. With
             // `--pmu` in the recipe the I²C window above already disqualifies this page, so this
             // line changes nothing today — which is exactly why it has to be here: without it the
@@ -1932,6 +1942,33 @@ impl Memory {
         };
         for r in self.regions.iter_mut().filter(|r| names.contains(&r.name)) {
             op.apply(&mut r.data);
+        }
+    }
+
+    /// Turn on the I2S sink: PCM stored to `IISFIFO_WR` is collected and written to `path` as WAV
+    /// by [`Audio::finish`].
+    ///
+    /// Two things change, both only from here. The FIFO port stops being backing store.
+    /// `IISFIFO_CFG` reads with its transmit free count at 16 (empty), which is what Rockbox's
+    /// `dma_tx_stop` spins for; the sink consumes at store time, so the FIFO is always empty.
+    pub fn enable_audio(&mut self, path: impl Into<std::path::PathBuf>, mclk_hz: f64) {
+        self.audio = Some(Audio::new(path, mclk_hz));
+        if !self.read_or_masks.iter().any(|&(at, _)| at == IISFIFO_CFG) {
+            self.read_or_masks.push((IISFIFO_CFG, IIS_TX_FREE_EMPTY));
+        }
+        self.invalidate_fast();
+    }
+
+    /// The codec's frame rate, when the sink is on and the codec is clocking.
+    pub fn audio_rate(&mut self) -> Option<u32> {
+        self.audio.as_mut()?.rate(&self.wm8758)
+    }
+
+    fn i2s_fifo_byte(&mut self, off: u32, val: u8) {
+        // Only the byte holding TXFIFOEN, bit 29.
+        let cfg = u32::from(self.peek(IISCONFIG + 3)) << 24;
+        if let Some(a) = &mut self.audio {
+            a.fifo_byte(off, val, &self.wm8758, cfg);
         }
     }
 
@@ -3284,6 +3321,10 @@ impl Memory {
                 let (pc, n, t) = (self.pc, self.icount, self.usec);
                 self.piezo.write8(off, val, pc, n, t);
             }
+        }
+        if self.audio.is_some() && addr.wrapping_sub(IISFIFO_WR) < 4 {
+            self.i2s_fifo_byte(addr - IISFIFO_WR, val);
+            return;
         }
         if let Some(base) = self.mmap_base {
             let off = addr.wrapping_sub(base);
@@ -4709,6 +4750,7 @@ impl Machine {
             i2c_last_reply: (0, [0; 4], 0),
             pmu: None,
             wm8758: Wm8758::new(),
+            audio: None,
             xmb: None,
             clickwheel: None,
             piezo: Piezo::new(Piezo::BASE),
