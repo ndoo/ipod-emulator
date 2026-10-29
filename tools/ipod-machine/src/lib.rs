@@ -1768,6 +1768,13 @@ struct FastPage {
     /// offset of any address in it is this plus the address's offset within the page.
     r_off: u32,
     w_off: u32,
+    /// The region holding the whole page for [`Memory::plain_word`], and where the page starts in
+    /// it. Unlike `r`, this does not require the page to be free of device windows: the word path
+    /// checks those per address and only needs to know where the backing bytes are. `u32::MAX` when
+    /// the translation is not uniform over the page or a region before the one that holds it
+    /// starts inside it, in which case the word path resolves the address itself.
+    p: u32,
+    p_off: u32,
 }
 
 /// Slots in the instruction-fetch cache. Code spends its time in a handful of pages (a loop, its
@@ -1801,6 +1808,8 @@ impl FastPage {
         w: u32::MAX,
         r_off: 0,
         w_off: 0,
+        p: u32::MAX,
+        p_off: 0,
     };
 }
 
@@ -2003,8 +2012,24 @@ impl Memory {
     #[inline(never)]
     fn fill_fast(&mut self, page: u32, slot: usize) -> FastPage {
         let mut n = FastPage { tag: page, ..FastPage::EMPTY };
+        let t = self.translate(page);
+        if self.translate(page.wrapping_add(PAGE - 1)) == t.wrapping_add(PAGE - 1) {
+            let holds = |r: &Region| (t.wrapping_sub(r.base) as usize) < r.data.len();
+            if let Some(i) = self.regions.iter().position(holds) {
+                let off = t.wrapping_sub(self.regions[i].base) as usize;
+                let before_overlaps = self.regions[..i].iter().any(|q| {
+                    (q.base as u64) < t as u64 + PAGE as u64
+                        && (t as u64) < q.base as u64 + q.data.len() as u64
+                });
+                if self.regions[i].data.len() - off >= PAGE as usize
+                    && off <= u32::MAX as usize
+                    && !before_overlaps
+                {
+                    (n.p, n.p_off) = (i as u32, off as u32);
+                }
+            }
+        }
         if self.page_is_plain(page) {
-            let t = self.translate(page);
             let contains = |r: &Region| (t.wrapping_sub(r.base) as usize) < r.data.len();
             // Whichever region the SLOW path would choose is the only correct answer, so pick
             // that one and then decide whether it is cacheable — never search past it for a
@@ -2896,6 +2921,11 @@ impl Memory {
             || (!self.internal && PP_DMA.iter().any(|c| hits(c.chans, 0x20 * c.n)))
         {
             return None;
+        }
+        let page = a & !(PAGE - 1);
+        let e = &self.fast[((page >> 12) as usize) & (FAST_SLOTS - 1)];
+        if e.tag == page && e.p != u32::MAX {
+            return Some((e.p as usize, e.p_off as usize + (a & (PAGE - 1)) as usize));
         }
         // One translation for the word — unless it straddles an alias edge, where each byte would
         // translate on its own.
@@ -13323,6 +13353,27 @@ mod word_path_tests {
         assert_eq!(m.mem.fetch32(0x100), other);
         assert_eq!(m.mem.fetch32(0x100), m.mem.read32(0x100));
         assert!(m.mem.fetch_hit(0x100));
+    }
+
+    /// The page-level location the word path reads from the cache is the one it would have found
+    /// by walking the regions.
+    #[test]
+    fn the_word_path_finds_the_same_region_from_the_cache() {
+        for cold in [false, true] {
+            let mut m = quiet_machine(cold);
+            let mut cached = 0;
+            for addr in addresses() {
+                m.mem.invalidate_fast();
+                let walked = m.mem.plain_word(addr);
+                m.mem.fast_region(addr, false);
+                let from_cache = m.mem.plain_word(addr);
+                if m.mem.fast[((addr >> 12) as usize) & (FAST_SLOTS - 1)].p != u32::MAX {
+                    cached += 1;
+                }
+                assert_eq!(walked, from_cache, "cold={cold} {addr:#010x}");
+            }
+            assert!(cached > 1000, "only {cached} words came from the cache; the test is not testing it");
+        }
     }
 
     /// The emulator's own reads of a DMA channel (the service tick makes a dozen) skip the
