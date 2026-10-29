@@ -2486,6 +2486,7 @@ dependencies = [
  "block2 0.6.2",
  "i-slint-backend-testing",
  "i-slint-backend-winit",
+ "ipod-audio",
  "ipod-machine",
  "libc",
  "objc2 0.6.4",
