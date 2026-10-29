@@ -1981,78 +1981,89 @@ impl Memory {
         }
     }
 
+    #[inline]
     fn fast_region(&mut self, addr: u32, write: bool) -> Option<(usize, usize)> {
         let page = addr & !(PAGE - 1);
         let slot = ((page >> 12) as usize) & (FAST_SLOTS - 1);
-        let e = self.fast[slot];
-        let e = if e.tag == page {
-            e
-        } else {
-            let mut n = FastPage { tag: page, ..FastPage::EMPTY };
-            if self.page_is_plain(page) {
-                let t = self.translate(page);
-                let contains = |r: &Region| (t.wrapping_sub(r.base) as usize) < r.data.len();
-                // Whichever region the SLOW path would choose is the only correct answer, so pick
-                // that one and then decide whether it is cacheable — never search past it for a
-                // region that happens to hold a whole page.
-                //
-                // Searching on was a silent data-corruption bug. Two regions share base 0 (the
-                // firmware image and SDRAM), and the image's last partial page — 0xba000..0xbaee4 —
-                // cannot hold a full 4 KB, so every read there fell through to SDRAM and returned
-                // **zeros instead of firmware**. Rockbox's `.init` copy is what exposed it: the copy
-                // stored faithfully, but the last 0xfb8 bytes it was handed were zeros, so the
-                // linker veneers at the end of `.init` never arrived and it executed into them.
-                // Nothing was ever reported unmapped, because the wrong region answered rather than
-                // no region at all.
-                let cacheable = |i: usize| {
-                    let r = &self.regions[i];
-                    let off = t.wrapping_sub(r.base) as usize;
-                    if r.data.len() - off >= PAGE as usize && off <= u32::MAX as usize {
-                        (i as u32, off as u32)
-                    } else {
-                        (u32::MAX, 0)
-                    }
-                };
-                (n.r, n.r_off) = self
-                    .regions
-                    .iter()
-                    .position(contains)
-                    .map_or((u32::MAX, 0), cacheable);
-                (n.w, n.w_off) = self
-                    .regions
-                    .iter()
-                    .position(|r| contains(r) && !self.readonly.contains(&r.name))
-                    .map_or((u32::MAX, 0), cacheable);
-            }
-            self.fast[slot] = n;
-            n
-        };
+        let mut e = self.fast[slot];
+        if e.tag != page {
+            e = self.fill_fast(page, slot);
+        }
         let (idx, off) = if write { (e.w, e.w_off) } else { (e.r, e.r_off) };
-        // Agreement with the slow path is the invariant; check it rather than trust it.
         if self.verify_memory && idx != u32::MAX {
-            let t = self.translate(addr);
-            let slow = if write {
-                self.regions.iter().position(|r| {
-                    (t.wrapping_sub(r.base) as usize) < r.data.len()
-                        && !self.readonly.contains(&r.name)
-                })
-            } else {
-                self.regions
-                    .iter()
-                    .position(|r| (t.wrapping_sub(r.base) as usize) < r.data.len())
-            };
-            if slow != Some(idx as usize) {
-                let fast_name = self.regions[idx as usize].name;
-                let slow_name = slow.map_or("(none)", |i| self.regions[i].name);
-                let pc = self.pc;
-                self.verify_mismatches
-                    .push((pc, addr, fast_name, slow_name));
-            }
+            self.verify_fast(addr, write, idx);
         }
         if idx == u32::MAX {
             return None;
         }
         Some((idx as usize, off as usize + (addr & (PAGE - 1)) as usize))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn fill_fast(&mut self, page: u32, slot: usize) -> FastPage {
+        let mut n = FastPage { tag: page, ..FastPage::EMPTY };
+        if self.page_is_plain(page) {
+            let t = self.translate(page);
+            let contains = |r: &Region| (t.wrapping_sub(r.base) as usize) < r.data.len();
+            // Whichever region the SLOW path would choose is the only correct answer, so pick
+            // that one and then decide whether it is cacheable — never search past it for a
+            // region that happens to hold a whole page.
+            //
+            // Searching on was a silent data-corruption bug. Two regions share base 0 (the
+            // firmware image and SDRAM), and the image's last partial page — 0xba000..0xbaee4 —
+            // cannot hold a full 4 KB, so every read there fell through to SDRAM and returned
+            // **zeros instead of firmware**. Rockbox's `.init` copy is what exposed it: the copy
+            // stored faithfully, but the last 0xfb8 bytes it was handed were zeros, so the
+            // linker veneers at the end of `.init` never arrived and it executed into them.
+            // Nothing was ever reported unmapped, because the wrong region answered rather than
+            // no region at all.
+            let cacheable = |i: usize| {
+                let r = &self.regions[i];
+                let off = t.wrapping_sub(r.base) as usize;
+                if r.data.len() - off >= PAGE as usize && off <= u32::MAX as usize {
+                    (i as u32, off as u32)
+                } else {
+                    (u32::MAX, 0)
+                }
+            };
+            (n.r, n.r_off) = self
+                .regions
+                .iter()
+                .position(contains)
+                .map_or((u32::MAX, 0), cacheable);
+            (n.w, n.w_off) = self
+                .regions
+                .iter()
+                .position(|r| contains(r) && !self.readonly.contains(&r.name))
+                .map_or((u32::MAX, 0), cacheable);
+        }
+        self.fast[slot] = n;
+        n
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn verify_fast(&mut self, addr: u32, write: bool, idx: u32) {
+    // Agreement with the slow path is the invariant; check it rather than trust it.
+        let t = self.translate(addr);
+        let slow = if write {
+            self.regions.iter().position(|r| {
+                (t.wrapping_sub(r.base) as usize) < r.data.len()
+                    && !self.readonly.contains(&r.name)
+            })
+        } else {
+            self.regions
+                .iter()
+                .position(|r| (t.wrapping_sub(r.base) as usize) < r.data.len())
+        };
+        if slow != Some(idx as usize) {
+            let fast_name = self.regions[idx as usize].name;
+            let slow_name = slow.map_or("(none)", |i| self.regions[i].name);
+            let pc = self.pc;
+            self.verify_mismatches
+                .push((pc, addr, fast_name, slow_name));
+        }
     }
 
     /// Recompute aliases from the MMAP windows. Called when the firmware programs one.
