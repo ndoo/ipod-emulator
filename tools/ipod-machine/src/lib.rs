@@ -2790,7 +2790,9 @@ impl Memory {
             || hits(self.piezo.base, Piezo::PAGE)
             || self.mmap_base.is_some_and(|b| hits(b, 0x40))
             || self.int_ack_on_read.iter().any(|&(at, _)| hits(at, 4))
-            || PP_DMA.iter().any(|c| hits(c.chans, 0x20 * c.n))
+            // The read-to-clear latch is skipped for the emulator's own reads, so for them the
+            // channel registers are plain words. `service_pp_dma` reads twelve of them a tick.
+            || (!self.internal && PP_DMA.iter().any(|c| hits(c.chans, 0x20 * c.n)))
         {
             return None;
         }
@@ -13139,6 +13141,29 @@ mod word_path_tests {
         }
         for addr in [0x6000_5000, 0x6000_d030, 0x6000_7000, 0x7000_0000] {
             assert!(m.mem.plain_word(addr).is_some(), "{addr:#010x} is plain backing store");
+        }
+    }
+
+    /// The emulator's own reads of a DMA channel (the service tick makes a dozen) skip the
+    /// read-to-clear latch, so they may take the word path; the firmware's may not.
+    #[test]
+    fn the_emulators_own_reads_of_a_dma_channel_take_the_word_path() {
+        for cold in [false, true] {
+            let (mut a, mut b) = (machine(cold), machine(cold));
+            a.mem.internal = true;
+            b.mem.internal = true;
+            for c in PP_DMA.iter() {
+                for off in (0..0x20 * c.n).step_by(4) {
+                    let addr = c.chans + off;
+                    assert!(a.mem.plain_word(addr).is_some(), "cold={cold} {addr:#010x}");
+                    assert_eq!(a.mem.read32(addr), b.mem.read32_via(addr, false), "cold={cold} {addr:#010x}");
+                }
+            }
+            for (ra, rb) in a.mem.regions.iter().zip(&b.mem.regions) {
+                assert!(ra.data == rb.data, "cold={cold}: {} differs", ra.name);
+            }
+            a.mem.internal = false;
+            assert!(a.mem.plain_word(PP_DMA[1].chans + DMA_STATUS).is_none());
         }
     }
 
