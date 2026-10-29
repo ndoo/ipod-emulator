@@ -42,7 +42,7 @@ pub use hw::mailbox::{Xmb, Mbx};
 pub use hw::flash::{Nor, NorOp};
 pub use hw::pmu::{Pcf50605};
 pub use hw::wm8758::Wm8758;
-pub use hw::audio::Audio;
+pub use hw::audio::{Audio, LiveChunk};
 use hw::audio::{IISCONFIG, IISFIFO_CFG, IISFIFO_WR, IIS_BLOCK, IIS_BLOCK_LEN, IIS_TX_FREE_EMPTY};
 pub use hw::ata::{Ata, PpDmaCtl};
 pub use hw::cop::{Core};
@@ -1958,7 +1958,34 @@ impl Memory {
     /// And [`Memory::fiq_routing`] comes on. Bypass ledger #21; retire it when a retail boot with
     /// the routing on matches one with it off.
     pub fn enable_audio(&mut self, path: impl Into<std::path::PathBuf>, mclk_hz: f64) {
-        self.audio = Some(Audio::new(path, mclk_hz));
+        let mut audio = Audio::new(path, mclk_hz);
+        if let Some(old) = self.audio.take() {
+            if old.live_enabled() {
+                audio.enable_live();
+            }
+        }
+        self.audio = Some(audio);
+        self.audio_hooks();
+    }
+
+    /// Turn on the I2S sink for a host audio device: frames are queued for [`Memory::take_audio`]
+    /// with the codec's volume and mute applied, and no file is written. Everything
+    /// [`Memory::enable_audio`] changes in the machine changes here too. When a file sink is
+    /// already on, it keeps writing and the queue is added to it.
+    pub fn enable_audio_live(&mut self, mclk_hz: f64) {
+        match &mut self.audio {
+            Some(a) => a.enable_live(),
+            None => self.audio = Some(Audio::live(mclk_hz)),
+        }
+        self.audio_hooks();
+    }
+
+    /// The frames the sink has queued since the last call; see [`Audio::take_live`].
+    pub fn take_audio(&mut self) -> Vec<LiveChunk> {
+        self.audio.as_mut().map_or_else(Vec::new, Audio::take_live)
+    }
+
+    fn audio_hooks(&mut self) {
         self.fiq_routing = true;
         if !self.read_or_masks.iter().any(|&(at, _)| at == IISFIFO_CFG) {
             self.read_or_masks.push((IISFIFO_CFG, IIS_TX_FREE_EMPTY));

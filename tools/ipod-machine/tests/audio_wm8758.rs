@@ -346,3 +346,120 @@ fn the_guest_image_is_kept_for_the_trace_boot() {
         assert_eq!(img[7], 0xea);
     }
 }
+
+/// Run the guest the way the window does: in slices, taking the queued live frames after each.
+fn run_live(m: &mut Machine) -> Vec<ipod_machine::LiveChunk> {
+    let mut out = Vec::new();
+    for _ in 0..120 {
+        m.run(250_000);
+        out.extend(m.mem.take_audio());
+        if word(m, 24) != 0 {
+            return out;
+        }
+    }
+    panic!("the guest never finished; pc {:#x}", m.cpu.regs[15]);
+}
+
+fn flatten(chunks: &[ipod_machine::LiveChunk]) -> Vec<f32> {
+    chunks.iter().flat_map(|c| c.pcm.iter().copied()).collect()
+}
+
+fn ring_f32(p: &Plan, gain: (f32, f32)) -> Vec<f32> {
+    let one = ring(p);
+    let total = (p.total_segs * p.seg_frames) as usize;
+    (0..total)
+        .flat_map(|n| {
+            let (l, r) = one[n % one.len()];
+            [
+                f32::from(l) / 32768.0 * gain.0,
+                f32::from(r) / 32768.0 * gain.1,
+            ]
+        })
+        .collect()
+}
+
+#[test]
+fn live_frames_are_the_frames_the_wav_gets_and_the_wav_is_unchanged() {
+    for rate in [44100, 48000] {
+        let p = plan(rate);
+        let img = image(&p);
+
+        let wav_only = out_path(&format!("live-off-{rate}.wav"));
+        let _ = std::fs::remove_file(&wav_only);
+        let mut a = machine(&img);
+        a.mem.enable_audio(&wav_only, Wm8758::DEFAULT_MCLK_HZ);
+        assert!(run_live(&mut a).is_empty(), "no queue unless asked for");
+        a.mem.audio.as_mut().unwrap().finish().unwrap();
+
+        let wav_both = out_path(&format!("live-on-{rate}.wav"));
+        let _ = std::fs::remove_file(&wav_both);
+        let mut b = machine(&img);
+        b.mem.enable_audio(&wav_both, Wm8758::DEFAULT_MCLK_HZ);
+        b.mem.enable_audio_live(Wm8758::DEFAULT_MCLK_HZ);
+        let chunks = run_live(&mut b);
+        b.mem.audio.as_mut().unwrap().finish().unwrap();
+
+        assert_eq!(
+            std::fs::read(&wav_only).unwrap(),
+            std::fs::read(&wav_both).unwrap(),
+            "{rate}: the WAV bytes do not depend on the live queue"
+        );
+        assert_eq!(
+            (a.mem.usec, a.fiqs_taken, a.executed),
+            (b.mem.usec, b.fiqs_taken, b.executed),
+            "{rate}: neither does the machine's time"
+        );
+        assert!(chunks.iter().all(|c| c.rate == rate), "{rate}");
+        // Volume 0 dB on the DAC and OUT1 in the guest's bring-up, so the gain is exactly 1.
+        assert_eq!(flatten(&chunks), ring_f32(&p, (1.0, 1.0)), "{rate}");
+        assert_eq!(b.mem.audio.as_ref().unwrap().live_dropped(), 0);
+    }
+}
+
+#[test]
+fn live_only_writes_no_file_and_keeps_no_pcm() {
+    let p = plan(44100);
+    let mut m = machine(&image(&p));
+    m.mem.enable_audio_live(Wm8758::DEFAULT_MCLK_HZ);
+    let chunks = run_live(&mut m);
+    assert_eq!(flatten(&chunks), ring_f32(&p, (1.0, 1.0)));
+    let a = m.mem.audio.as_mut().unwrap();
+    assert!(a.finish().unwrap().is_empty());
+    assert!(a.take_live().is_empty(), "taken once, gone");
+    assert_eq!(m.fiqs_taken, u64::from(p.total_segs));
+}
+
+#[test]
+fn live_frames_follow_soft_mute_and_the_volume_registers() {
+    // Soft mute written last: every frame is silent, the WAV path would still hold the tone.
+    let mut p = plan(44100);
+    p.regs.push((0x0a, 0x040));
+    let mut m = machine(&image(&p));
+    m.mem.enable_audio_live(Wm8758::DEFAULT_MCLK_HZ);
+    let got = flatten(&run_live(&mut m));
+    assert_eq!(got.len(), (p.total_segs * p.seg_frames * 2) as usize);
+    assert!(got.iter().all(|&s| s == 0.0));
+
+    // The sound layer's 10% setting: DAC 207, PGA 0, which is -81 dB on both channels.
+    let mut p = plan(44100);
+    p.regs
+        .extend([(0x0b, 0x0cf), (0x0c, 0x1cf), (0x34, 0x080), (0x35, 0x180)]);
+    let mut m = machine(&image(&p));
+    m.mem.enable_audio_live(Wm8758::DEFAULT_MCLK_HZ);
+    let got = flatten(&run_live(&mut m));
+    let g = 10f32.powf(-81.0 / 20.0);
+    let want = ring_f32(&p, (g, g));
+    assert_eq!(got.len(), want.len());
+    for (n, (a, b)) in got.iter().zip(&want).enumerate() {
+        assert!((a - b).abs() < 1e-9, "sample {n}: {a} against {b}");
+    }
+
+    // Left and right are separate: right DAC volume 0 mutes the right channel only.
+    let mut p = plan(44100);
+    p.regs.push((0x0c, 0x100));
+    let mut m = machine(&image(&p));
+    m.mem.enable_audio_live(Wm8758::DEFAULT_MCLK_HZ);
+    let got = flatten(&run_live(&mut m));
+    let want = ring_f32(&p, (1.0, 0.0));
+    assert_eq!(got, want);
+}

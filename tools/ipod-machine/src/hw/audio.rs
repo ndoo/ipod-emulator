@@ -20,6 +20,12 @@
 //! What is not modelled: DAC volume, soft mute, the EQ and the 3D stage, so the file is the PCM
 //! at the codec's input, not at its output. The FIFO has no depth here; the DMA completion pacing
 //! in `run_pp_dma` stands in for it.
+//!
+//! **Live output** ([`Audio::live`]) is a second consumer of the same frames. It keeps no file and
+//! applies [`Wm8758::output_gain`] to each frame as it arrives, so a codec that is muted or turned
+//! down gives silence or quiet frames at the time the firmware sent them. The frames wait in a
+//! queue that the host drains with [`Audio::take_live`]; the WAV bytes are the same with it on or
+//! off.
 
 use crate::hw::wm8758::Wm8758;
 use std::path::PathBuf;
@@ -41,8 +47,30 @@ struct Segment {
     pcm: Vec<i16>,
 }
 
+/// Frames for the host's audio device: one rate, interleaved left/right, in the range -1.0..1.0
+/// with the codec's output gain applied.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LiveChunk {
+    pub rate: u32,
+    pub pcm: Vec<f32>,
+}
+
+/// The most frames [`Audio::take_live`] leaves queued. A host that drains once per slice never
+/// gets near it; it bounds a host that stops draining.
+pub const LIVE_QUEUE_FRAMES: usize = 1 << 16;
+
+#[derive(Default)]
+struct Live {
+    chunks: Vec<LiveChunk>,
+    queued: usize,
+    dropped: u64,
+    /// `(codec.writes when computed, gain)`.
+    gain: Option<(u64, (f32, f32))>,
+}
+
 pub struct Audio {
-    path: PathBuf,
+    path: Option<PathBuf>,
+    live: Option<Live>,
     pub mclk_hz: f64,
     segments: Vec<Segment>,
     bytes: [u8; 4],
@@ -63,8 +91,13 @@ pub struct Audio {
 
 impl Audio {
     pub fn new(path: impl Into<PathBuf>, mclk_hz: f64) -> Self {
+        Self::build(Some(path.into()), mclk_hz)
+    }
+
+    fn build(path: Option<PathBuf>, mclk_hz: f64) -> Self {
         Self {
-            path: path.into(),
+            path,
+            live: None,
             mclk_hz,
             segments: Vec::new(),
             bytes: [0; 4],
@@ -77,6 +110,38 @@ impl Audio {
             frames_dac_off: 0,
             written: Vec::new(),
         }
+    }
+
+    /// A sink that keeps no file and queues frames for [`Audio::take_live`].
+    pub fn live(mclk_hz: f64) -> Self {
+        let mut a = Self::build(None, mclk_hz);
+        a.live = Some(Live::default());
+        a
+    }
+
+    /// Also queue frames for [`Audio::take_live`], on a sink that already writes a file.
+    pub fn enable_live(&mut self) {
+        self.live.get_or_insert_with(Live::default);
+    }
+
+    pub fn live_enabled(&self) -> bool {
+        self.live.is_some()
+    }
+
+    /// The frames queued since the last call, oldest first, in chunks of one rate each.
+    pub fn take_live(&mut self) -> Vec<LiveChunk> {
+        match &mut self.live {
+            Some(l) => {
+                l.queued = 0;
+                std::mem::take(&mut l.chunks)
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Frames discarded because [`LIVE_QUEUE_FRAMES`] were already waiting.
+    pub fn live_dropped(&self) -> u64 {
+        self.live.as_ref().map_or(0, |l| l.dropped)
     }
 
     /// The codec's current frame rate, or `None` while it is not clocking.
@@ -114,29 +179,57 @@ impl Audio {
         if codec.dac_enabled() == (false, false) {
             self.frames_dac_off += 1;
         }
-        if self.segments.last().is_none_or(|s| s.rate != rate) {
-            self.segments.push(Segment {
-                rate,
-                pcm: Vec::new(),
-            });
+        let (left, right) = (word as u16 as i16, (word >> 16) as u16 as i16);
+        if self.path.is_some() {
+            if self.segments.last().is_none_or(|s| s.rate != rate) {
+                self.segments.push(Segment {
+                    rate,
+                    pcm: Vec::new(),
+                });
+            }
+            let seg = self.segments.last_mut().unwrap();
+            seg.pcm.push(left);
+            seg.pcm.push(right);
         }
-        let seg = self.segments.last_mut().unwrap();
-        seg.pcm.push(word as u16 as i16);
-        seg.pcm.push((word >> 16) as u16 as i16);
         self.frames += 1;
+        if let Some(live) = &mut self.live {
+            let (gl, gr) = match live.gain {
+                Some((at, g)) if at == codec.writes => g,
+                _ => {
+                    let g = codec.output_gain();
+                    live.gain = Some((codec.writes, g));
+                    g
+                }
+            };
+            if live.queued >= LIVE_QUEUE_FRAMES {
+                live.dropped += 1;
+                return;
+            }
+            if live.chunks.last().is_none_or(|c| c.rate != rate) {
+                live.chunks.push(LiveChunk {
+                    rate,
+                    pcm: Vec::new(),
+                });
+            }
+            let chunk = live.chunks.last_mut().unwrap();
+            chunk.pcm.push(f32::from(left) / 32768.0 * gl);
+            chunk.pcm.push(f32::from(right) / 32768.0 * gr);
+            live.queued += 1;
+        }
     }
 
     /// The path segment `n` is written to: the requested path for the first, `STEM.N.EXT` after.
     fn segment_path(&self, n: usize) -> PathBuf {
+        let path = self.path.clone().unwrap_or_default();
         if n == 0 {
-            return self.path.clone();
+            return path;
         }
-        let stem = self.path.file_stem().unwrap_or_default().to_string_lossy();
-        let name = match self.path.extension() {
+        let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+        let name = match path.extension() {
             Some(e) => format!("{stem}.{n}.{}", e.to_string_lossy()),
             None => format!("{stem}.{n}"),
         };
-        self.path.with_file_name(name)
+        path.with_file_name(name)
     }
 
     /// Write every captured segment and forget it. Writes nothing if no frame was captured.
@@ -154,10 +247,14 @@ impl Audio {
     }
 
     pub fn report(&self) -> Vec<String> {
+        let target = self
+            .path
+            .as_ref()
+            .map_or_else(|| "live output".to_string(), |p| p.display().to_string());
         let mut out = vec![format!(
             "audio sink -> {}: {} FIFO words, {} frames kept, {} dropped (TXFIFOEN clear), \
              {} dropped (codec not clocking), {} kept with both DACs off",
-            self.path.display(),
+            target,
             self.words,
             self.frames,
             self.dropped_fifo_disabled,
@@ -176,7 +273,13 @@ impl Audio {
         for p in &self.written {
             out.push(format!("  wrote {}", p.display()));
         }
-        if self.frames == 0 {
+        if self.live_dropped() > 0 {
+            out.push(format!(
+                "  {} live frames dropped (queue full)",
+                self.live_dropped()
+            ));
+        }
+        if self.frames == 0 && self.path.is_some() {
             out.push("  no frame captured; no file written".into());
         }
         out
@@ -349,5 +452,57 @@ mod tests {
         on.transfer(0x82, [0x03 << 1, 0x0f, 0, 0]);
         send(&mut a, &on, IIS_TXFIFOEN, 7);
         assert_eq!((a.frames, a.frames_dac_off), (2, 1));
+    }
+
+    #[test]
+    fn live_frames_carry_the_codec_gain_and_split_on_a_rate_change() {
+        let mut a = Audio::live(Wm8758::DEFAULT_MCLK_HZ);
+        let mut c = clocked(44100);
+        c.transfer(0x82, [0x03 << 1, 0x0f, 0, 0]);
+        // DAC volume 223: -16 dB. OUT1 volume 57: 0 dB.
+        c.transfer(0x82, [0x0b << 1, 223, 0, 0]);
+        send(&mut a, &c, IIS_TXFIFOEN, 0x4000_c000);
+        for (reg, val) in [
+            (0x24u8, 0x018u16),
+            (0x25, 0x00c),
+            (0x26, 0x093),
+            (0x27, 0x0e9),
+        ] {
+            c.transfer(0x82, [reg << 1, val as u8, 0, 0]);
+        }
+        send(&mut a, &c, IIS_TXFIFOEN, 0x0000_0000);
+        let chunks = a.take_live();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!((chunks[0].rate, chunks[1].rate), (44100, 48000));
+        let g = 10f32.powf(-16.0 / 20.0);
+        // Left is the low halfword (-16384), right the high one (16384). The right DAC volume was
+        // never written, so it is at its reset value, 0 dB.
+        assert!(
+            (chunks[0].pcm[0] - (-0.5 * g)).abs() < 1e-6,
+            "{:?}",
+            chunks[0].pcm
+        );
+        assert_eq!(chunks[0].pcm[1], 0.5);
+        assert!(a.take_live().is_empty());
+        assert!(
+            a.finish().unwrap().is_empty(),
+            "live only: nothing to write"
+        );
+        assert_eq!(a.frames, 2);
+        assert!(a.report()[0].contains("live output"));
+    }
+
+    #[test]
+    fn the_live_queue_is_bounded_when_nobody_drains_it() {
+        let mut a = Audio::live(Wm8758::DEFAULT_MCLK_HZ);
+        let mut c = clocked(44100);
+        c.transfer(0x82, [0x03 << 1, 0x0f, 0, 0]);
+        for _ in 0..LIVE_QUEUE_FRAMES + 5 {
+            send(&mut a, &c, IIS_TXFIFOEN, 0x0001_0001);
+        }
+        assert_eq!(a.live_dropped(), 5);
+        assert_eq!(a.take_live()[0].pcm.len(), LIVE_QUEUE_FRAMES * 2);
+        send(&mut a, &c, IIS_TXFIFOEN, 0x0001_0001);
+        assert_eq!(a.live_dropped(), 5, "draining makes room");
     }
 }
