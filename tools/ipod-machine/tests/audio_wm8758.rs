@@ -463,3 +463,31 @@ fn live_frames_follow_soft_mute_and_the_volume_registers() {
     let want = ring_f32(&p, (1.0, 0.0));
     assert_eq!(got, want);
 }
+
+/// Only the audio DMA controller's interrupt (26) is routed as FIQ. RetailOS sets the priority bits
+/// of other sources too, and with those routed its boot stalls in an FIQ storm.
+#[test]
+fn only_the_audio_dma_source_is_delivered_as_fiq() {
+    const CPU_INT_EN: u32 = 0x6000_4024;
+    const INT_FORCED_SET: u32 = 0x6000_4018;
+    const CPU_INT_PRIORITY: u32 = 0x6000_402c;
+
+    let run_with = |source: u32| {
+        // Every vector is `b .`.
+        let img: Vec<u8> = (0..16)
+            .flat_map(|_| 0xeaff_fffe_u32.to_le_bytes())
+            .collect();
+        let mut m = machine(&img);
+        m.mem.enable_audio_live(Wm8758::DEFAULT_MCLK_HZ);
+        m.cpu.cpsr.0 &= !0xc0;
+        m.mem.write32(CPU_INT_PRIORITY, (1 << 26) | (1 << 27));
+        m.mem.write32(CPU_INT_EN, 1 << source);
+        m.mem.write32(INT_FORCED_SET, 1 << source);
+        m.run(20_000);
+        (m.irqs_taken, m.fiqs_taken)
+    };
+    let (irqs, fiqs) = run_with(27);
+    assert!(irqs > 0 && fiqs == 0, "source 27: {irqs} IRQs, {fiqs} FIQs");
+    let (irqs, fiqs) = run_with(26);
+    assert!(fiqs > 0 && irqs == 0, "source 26: {irqs} IRQs, {fiqs} FIQs");
+}

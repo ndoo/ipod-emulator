@@ -7468,7 +7468,7 @@ pub fn install_game_stubs(&mut self, exe_stem: &str, o: GameStubs) -> bool {
         self.mem.write32(CPU_HI_INT_STAT, pending_hi & enabled_hi);
         // Level, like the IRQ: a FIQ masked in the CPSR stays asserted and is retried next tick.
         let prio = if self.mem.fiq_routing {
-            self.mem.read32(CPU_INT_PRIORITY)
+            self.mem.read32(CPU_INT_PRIORITY) & FIQ_ROUTED
         } else {
             0
         };
@@ -10423,6 +10423,10 @@ pub const PROC_ID: u32 = 0x6000_0000;
 pub const CPU_CTRL: u32 = 0x6000_7000;
 /// A set bit routes that source to the CPU as FIQ. Rockbox's `pp5020.h`.
 pub const CPU_INT_PRIORITY: u32 = 0x6000_402c;
+/// The sources `CPU_INT_PRIORITY` can route to FIQ here: the audio DMA controller, IRQ 26. RetailOS
+/// also sets the bits of IRQ 27 and the aggregate, and with those routed its boot never lights the
+/// panel (an FIQ storm on the second DMA controller's pending line).
+pub const FIQ_ROUTED: u32 = 1 << 26;
 
 /// Software-raised interrupts, low bank and high. Rockbox names all six registers and uses none of
 /// them; RetailOS uses them as its deferred-work mechanism, which is why they matter here. Its DMA
