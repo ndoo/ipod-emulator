@@ -255,6 +255,8 @@ pub struct Config {
     /// seeds the bare-iPod value `0x08`; this puts the machine back on a wall socket **on purpose**,
     /// which is the only configuration in which there is a charging screen to return to.
     pub charger: bool,
+    /// `--audio-live`: open the host's default audio output and play the codec's output on it.
+    pub audio_live: bool,
     /// `--samples=8,12,16` — where the probe samples the panel, in **millions of instructions**
     /// past the moment it acts. Empty means [`PROBE_SAMPLES`].
     pub samples: Vec<u64>,
@@ -2091,6 +2093,25 @@ pub fn run(cfg: Config, link: Arc<Link>) {
     let mut first = true;
     // Across sessions, because "again" is a fact about the sequence and a session cannot see one.
     let mut deaths = Deaths::default();
+    // Opened and dropped on this thread: the stream handle is not `Send` on every platform. A
+    // device that will not open turns the flag off rather than stopping the machine.
+    let mut audio = if cfg.audio_live {
+        match ipod_audio::open(ipod_audio::Config::default()) {
+            Ok((device, feeder)) => {
+                println!(
+                    "audio: {} at {} Hz, {} channels; the codec's output is played live",
+                    device.name, device.rate, device.channels
+                );
+                Some(AudioOut { device, feeder })
+            }
+            Err(e) => {
+                eprintln!("audio: {e}; --audio-live is off for this run");
+                None
+            }
+        }
+    } else {
+        None
+    };
     loop {
         // **A title gets the frame pump, and a boot gets the boot.** Decided here rather than
         // inside `session` for the same reason `build` decides it rather than threading a flag
@@ -2107,8 +2128,13 @@ pub fn run(cfg: Config, link: Arc<Link>) {
                 }
             }
         } else {
-            session(&cfg, &link, first, &mut deaths)
+            session(&cfg, &link, first, &mut deaths, audio.as_mut())
         };
+        if matches!(outcome, Outcome::Quit) {
+            if let Some(a) = &audio {
+                println!("{}", a.device.stats.snapshot().report(a.device.rate));
+            }
+        }
         match outcome {
             Outcome::Quit => return,
             Outcome::ColdBoot => first = false,
@@ -2126,6 +2152,12 @@ pub fn run(cfg: Config, link: Arc<Link>) {
             }
         }
     }
+}
+
+/// The host audio output of a run started with `--audio-live`.
+struct AudioOut {
+    device: ipod_audio::Device,
+    feeder: ipod_audio::Feeder,
 }
 
 /// The five bits a title tests one by one, at `0x18008304` onward. Not the window's own
@@ -2402,7 +2434,13 @@ fn wait_for_power(link: &Arc<Link>) -> bool {
 }
 
 /// One power cycle: build the machine, run it, and stop when the window closes or power is cut.
-fn session(cfg: &Config, link: &Arc<Link>, first: bool, deaths: &mut Deaths) -> Outcome {
+fn session(
+    cfg: &Config,
+    link: &Arc<Link>,
+    first: bool,
+    deaths: &mut Deaths,
+    mut audio: Option<&mut AudioOut>,
+) -> Outcome {
     let mut m = match build(cfg, first) {
         Ok(m) => m,
         Err(e) => {
@@ -2604,6 +2642,11 @@ fn session(cfg: &Config, link: &Arc<Link>, first: bool, deaths: &mut Deaths) -> 
     // power cycle is a new one — `run`'s outer loop builds a fresh `Machine` and gets a fresh one
     // of these with it.
     let mut quiet = Quiet::default();
+    // After the restore, which replaces machine state: the sink is not part of a snapshot.
+    if audio.is_some() {
+        m.mem
+            .enable_audio_live(ipod_machine::Wm8758::DEFAULT_MCLK_HZ);
+    }
 
     loop {
         if link.quit.load(Ordering::Relaxed) {
@@ -2658,6 +2701,10 @@ fn session(cfg: &Config, link: &Arc<Link>, first: bool, deaths: &mut Deaths) -> 
             m.call_with(pc, &[0, 0, 0, 0], SLICE)
         };
         let executed = m.executed as u64;
+        if let Some(a) = audio.as_deref_mut() {
+            a.feeder
+                .pump(&mut m.mem, || link.quit.load(Ordering::Relaxed));
+        }
 
         // The scripted power cycle, in the first session only. Announced with the machine's own
         // numbers so the second session's are visibly a different machine's.

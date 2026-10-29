@@ -62,6 +62,7 @@ accessibility = ["slint/accessibility"]
 
 [dependencies]
 ipod-machine = { path = "../ipod-machine" }
+ipod-audio = { path = "../ipod-audio" }
 
 # ── The file picker (docs/GUI.md §17 Q3, §11.4) ──────────────────────────────────────────────────
 #
