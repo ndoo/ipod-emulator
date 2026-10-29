@@ -580,6 +580,8 @@ pub struct Memory {
     /// Direct-mapped page-resolution cache for the 32-bit fast path. Boxed because it is large and
     /// only ever touched through indices.
     fast: Box<[FastPage]>,
+    /// Pages instruction fetch has recently been served from; see [`Memory::fetch32`].
+    fetch: [FetchPage; FETCH_SLOTS],
     /// Unmapped accesses, aggregated per 4 KB page rather than logged one by one.
     ///
     /// The flat log this replaces was capped at 4096 entries to survive a runaway loop, with the
@@ -1768,6 +1770,29 @@ struct FastPage {
     w_off: u32,
 }
 
+/// Slots in the instruction-fetch cache. Code spends its time in a handful of pages (a loop, its
+/// callees, the interrupt vector), so a small direct-mapped array is enough.
+const FETCH_SLOTS: usize = 16;
+
+/// A page instruction fetch resolved once: the region that answers it and where the page starts
+/// inside that region.
+///
+/// **It holds a location and never the instruction.** The fetch reads the region's bytes each time,
+/// so a store to a code page (self-modifying code, a loader copying an image over its own tail, the
+/// flash updater) is seen by the next fetch with nothing to invalidate. What can go stale is the
+/// location, and that changes only where [`Memory::invalidate_fast`] is already called: a region
+/// added, an alias or MMAP window rebuilt, a NOR mode change.
+#[derive(Clone, Copy)]
+struct FetchPage {
+    tag: u32,
+    idx: u32,
+    off: u32,
+}
+
+impl FetchPage {
+    const EMPTY: FetchPage = FetchPage { tag: 1, idx: 0, off: 0 };
+}
+
 impl FastPage {
     // Tag 1 is never a page base (pages are 4 KiB-aligned), so an empty slot can never match.
     const EMPTY: FastPage = FastPage {
@@ -2154,6 +2179,14 @@ impl Memory {
         for e in self.fast.iter_mut() {
             *e = FastPage::EMPTY;
         }
+        self.fetch = [FetchPage::EMPTY; FETCH_SLOTS];
+    }
+
+    /// Whether instruction fetch already holds `addr`'s page, which makes it mapped.
+    #[inline]
+    fn fetch_hit(&self, addr: u32) -> bool {
+        let page = addr & !(PAGE - 1);
+        self.fetch[(page >> 12) as usize & (FETCH_SLOTS - 1)].tag == page
     }
 
     /// Whether the resolution cache already holds a readable region for `addr`'s page. Read-only
@@ -2637,6 +2670,34 @@ impl Bus for Memory {
         self.write8_inner(addr, val)
     }
 
+    fn fetch32(&mut self, addr: u32) -> u32 {
+        let a = addr & !3;
+        let e = self.fetch[(a >> 12) as usize & (FETCH_SLOTS - 1)];
+        if e.tag == a & !(PAGE - 1) && !self.reads_instrumented() {
+            let at = e.off as usize + (a & (PAGE - 1)) as usize;
+            if let Some(d) = self.regions[e.idx as usize].data.get(at..at + 4) {
+                return u32::from_le_bytes([d[0], d[1], d[2], d[3]]);
+            }
+        }
+        let v = self.read32(a);
+        self.fill_fetch(a);
+        v
+    }
+
+    fn fetch16(&mut self, addr: u32) -> u16 {
+        let a = addr & !1;
+        let e = self.fetch[(a >> 12) as usize & (FETCH_SLOTS - 1)];
+        if e.tag == a & !(PAGE - 1) && !self.reads_instrumented() {
+            let at = e.off as usize + (a & (PAGE - 1)) as usize;
+            if let Some(d) = self.regions[e.idx as usize].data.get(at..at + 2) {
+                return u16::from_le_bytes([d[0], d[1]]);
+            }
+        }
+        let v = self.read16(a);
+        self.fill_fetch(a);
+        v
+    }
+
     /// Two byte reads in one resolution; see [`Memory::plain_read`] for when that is the same
     /// thing. The default is `read8` twice, which is what every other case still does.
     fn read16(&mut self, addr: u32) -> u16 {
@@ -2650,6 +2711,40 @@ impl Bus for Memory {
 }
 
 impl Memory {
+    /// Whether a read has to be accounted: one of the instruments that need to see every read
+    /// address is armed. Every fast read path declines while it is.
+    #[inline]
+    fn reads_instrumented(&self) -> bool {
+        self.accounting
+            || self.page_log.is_some()
+            || !self.read_addrs.is_empty()
+            || self.input_probe.is_some()
+    }
+
+    /// Remember the page a fetch has just been served from, if the byte path would answer every
+    /// word of it from the region and nothing else.
+    ///
+    /// The two core registers sit in pages that are otherwise plain, and `core_register` answers
+    /// them ahead of the region, so those pages are never remembered. `verify_memory` is the
+    /// checking mode of the cache this one sits on; it is left to run its own comparison.
+    fn fill_fetch(&mut self, a: u32) {
+        let page = a & !(PAGE - 1);
+        if self.verify_memory
+            || self.reads_instrumented()
+            || page == PROC_ID
+            || (self.second_core && Core::Cop.ctrl() & !(PAGE - 1) == page)
+        {
+            return;
+        }
+        if let Some((idx, off)) = self.fast_region(a, false) {
+            self.fetch[(page >> 12) as usize & (FETCH_SLOTS - 1)] = FetchPage {
+                tag: page,
+                idx: idx as u32,
+                off: (off - (a & (PAGE - 1)) as usize) as u32,
+            };
+        }
+    }
+
     /// The region and offset that answer a read of `addr` when nothing but the backing bytes could
     /// matter, or `None` when the byte path has to run.
     ///
@@ -2666,12 +2761,7 @@ impl Memory {
     /// each was a walk over the alias list, ten device windows and the region list, per byte.
     #[inline]
     fn plain_read(&mut self, addr: u32) -> Option<(usize, usize)> {
-        if self.accounting
-            || self.page_log.is_some()
-            || !self.read_addrs.is_empty()
-            || self.input_probe.is_some()
-            || self.core_register(addr & !3).is_some()
-        {
+        if self.reads_instrumented() || self.core_register(addr & !3).is_some() {
             return None;
         }
         self.fast_region(addr, false)
@@ -4794,6 +4884,7 @@ impl Machine {
             page_counts: BTreeMap::new(),
             accounting: false,
             fast: vec![FastPage::EMPTY; FAST_SLOTS].into_boxed_slice(),
+            fetch: [FetchPage::EMPTY; FETCH_SLOTS],
             readonly: Vec::new(),
             internal: false,
             region_reads: Vec::new(),
@@ -9760,7 +9851,7 @@ pub fn install_game_stubs(&mut self, exe_stem: &str, o: GameStubs) -> bool {
     /// firmware jumps into the uncached view, so an alias that only worked for loads and stores
     /// would report code as unmapped and stop the run at the first such branch.
     fn is_mapped(&self, addr: u32) -> bool {
-        if self.mem.fast_hit(addr) {
+        if self.mem.fetch_hit(addr) || self.mem.fast_hit(addr) {
             return true;
         }
         let addr = self.mem.translate(addr);
@@ -13142,6 +13233,85 @@ mod word_path_tests {
         for addr in [0x6000_5000, 0x6000_d030, 0x6000_7000, 0x7000_0000] {
             assert!(m.mem.plain_word(addr).is_some(), "{addr:#010x} is plain backing store");
         }
+    }
+
+    /// `machine`, with the read instruments off, so the fetch cache is allowed to answer.
+    fn quiet_machine(cold: bool) -> Machine {
+        let mut m = machine(cold);
+        m.mem.accounting = false;
+        m.mem.input_probe = None;
+        m.mem.read_addrs.clear();
+        m.mem.set_store_addr_bounds();
+        m
+    }
+
+    /// A fetch is a read: the cache may only be a faster way to the same word, on every device page
+    /// as well as on RAM, and with the same side effects when it declines.
+    #[test]
+    fn a_fetch_returns_what_a_read_returns() {
+        for cold in [false, true] {
+            let (mut a, mut b) = (quiet_machine(cold), quiet_machine(cold));
+            a.mem.int_pending = 0xffff_ffff;
+            b.mem.int_pending = 0xffff_ffff;
+            let mut cached = 0;
+            // Twice, so the second pass is the one the cache serves.
+            for pass in 0..2 {
+                for (n, addr) in addresses().into_iter().enumerate() {
+                    let asked = addr | (n as u32 & 3);
+                    if pass == 1 && a.mem.fetch_hit(addr) {
+                        cached += 1;
+                    }
+                    assert_eq!(a.mem.fetch32(asked), b.mem.read32(asked), "cold={cold} {asked:#010x}");
+                    let half = addr | (n as u32 & 2);
+                    assert_eq!(a.mem.fetch16(half), b.mem.read16(half), "cold={cold} {half:#010x}");
+                }
+            }
+            assert!(cached > 1000, "the cache served only {cached} fetches; the test is not testing it");
+            assert_eq!(a.mem.int_pending, b.mem.int_pending, "cold={cold}");
+            for (ra, rb) in a.mem.regions.iter().zip(&b.mem.regions) {
+                assert!(ra.data == rb.data, "cold={cold}: {} differs", ra.name);
+            }
+            // The core registers answer ahead of their region and are never remembered.
+            assert!(!a.mem.fetch_hit(PROC_ID));
+        }
+    }
+
+    /// Self-modifying code and the loader that copies an image over its own tail: a store of any
+    /// width to a page the fetch cache holds is what the next fetch returns.
+    #[test]
+    fn a_store_to_a_fetched_page_is_the_next_fetch() {
+        let mut m = quiet_machine(false);
+        let at = 0x1000_2000;
+        let old = m.mem.fetch32(at);
+        assert!(m.mem.fetch_hit(at), "the first fetch should have filled the cache");
+        assert_eq!(m.mem.fetch32(at), old);
+        m.mem.write32(at, 0xe1a0_0000);
+        assert_eq!(m.mem.fetch32(at), 0xe1a0_0000);
+        m.mem.write8(at + 1, 0x5a);
+        assert_eq!(m.mem.fetch32(at), 0xe1a0_5a00);
+        m.mem.write16(at + 2, 0x4770);
+        assert_eq!(m.mem.fetch16(at + 2), 0x4770);
+        assert_eq!(m.mem.fetch32(at), 0x4770_5a00);
+        assert!(m.mem.fetch_hit(at));
+    }
+
+    /// Programming an MMAP window changes which memory an address reaches. A cached fetch location
+    /// is dropped with the rest of the page cache, so the next fetch comes from the new place.
+    #[test]
+    fn a_remap_changes_what_a_cached_fetch_returns() {
+        let mut m = quiet_machine(false);
+        let before = m.mem.fetch32(0x100);
+        assert!(m.mem.fetch_hit(0x100));
+        // The LCD window stands in for "some other memory": plain, and filled with its own pattern.
+        let other = m.mem.read32(0x3000_0100);
+        assert_ne!(before, other, "the pattern must tell the two views apart");
+        m.mem.mmap_regs[0] = 0x0000_3c00;
+        m.mem.mmap_regs[1] = 0x0000_0f84 | 0x3000_0000;
+        m.mem.rebuild_mmap_aliases();
+        assert!(!m.mem.fetch_hit(0x100), "a remap must drop the cached location");
+        assert_eq!(m.mem.fetch32(0x100), other);
+        assert_eq!(m.mem.fetch32(0x100), m.mem.read32(0x100));
+        assert!(m.mem.fetch_hit(0x100));
     }
 
     /// The emulator's own reads of a DMA channel (the service tick makes a dozen) skip the
