@@ -1761,6 +1761,11 @@ struct FastPage {
     tag: u32,
     r: u32,
     w: u32,
+    /// Offset of the page's first byte inside the region that answers reads and writes. A page is
+    /// only cached when [`Memory::page_is_plain`] saw one uniform translation across it, so the
+    /// offset of any address in it is this plus the address's offset within the page.
+    r_off: u32,
+    w_off: u32,
 }
 
 impl FastPage {
@@ -1769,6 +1774,8 @@ impl FastPage {
         tag: 1,
         r: u32::MAX,
         w: u32::MAX,
+        r_off: 0,
+        w_off: 0,
     };
 }
 
@@ -1953,14 +1960,11 @@ impl Memory {
         let page = addr & !(PAGE - 1);
         let slot = ((page >> 12) as usize) & (FAST_SLOTS - 1);
         let e = self.fast[slot];
-        let idx = if e.tag == page {
-            if write {
-                e.w
-            } else {
-                e.r
-            }
+        let e = if e.tag == page {
+            e
         } else {
-            let (r, w) = if self.page_is_plain(page) {
+            let mut n = FastPage { tag: page, ..FastPage::EMPTY };
+            if self.page_is_plain(page) {
                 let t = self.translate(page);
                 let contains = |r: &Region| (t.wrapping_sub(r.base) as usize) < r.data.len();
                 // Whichever region the SLOW path would choose is the only correct answer, so pick
@@ -1978,33 +1982,27 @@ impl Memory {
                 let cacheable = |i: usize| {
                     let r = &self.regions[i];
                     let off = t.wrapping_sub(r.base) as usize;
-                    if r.data.len() - off >= PAGE as usize {
-                        i as u32
+                    if r.data.len() - off >= PAGE as usize && off <= u32::MAX as usize {
+                        (i as u32, off as u32)
                     } else {
-                        u32::MAX
+                        (u32::MAX, 0)
                     }
                 };
-                let rd = self
+                (n.r, n.r_off) = self
                     .regions
                     .iter()
                     .position(contains)
-                    .map_or(u32::MAX, cacheable);
-                let wr = self
+                    .map_or((u32::MAX, 0), cacheable);
+                (n.w, n.w_off) = self
                     .regions
                     .iter()
                     .position(|r| contains(r) && !self.readonly.contains(&r.name))
-                    .map_or(u32::MAX, cacheable);
-                (rd, wr)
-            } else {
-                (u32::MAX, u32::MAX)
-            };
-            self.fast[slot] = FastPage { tag: page, r, w };
-            if write {
-                w
-            } else {
-                r
+                    .map_or((u32::MAX, 0), cacheable);
             }
+            self.fast[slot] = n;
+            n
         };
+        let (idx, off) = if write { (e.w, e.w_off) } else { (e.r, e.r_off) };
         // Agreement with the slow path is the invariant; check it rather than trust it.
         if self.verify_memory && idx != u32::MAX {
             let t = self.translate(addr);
@@ -2029,9 +2027,7 @@ impl Memory {
         if idx == u32::MAX {
             return None;
         }
-        let base = self.regions[idx as usize].base;
-        let off = self.translate(addr).wrapping_sub(base) as usize;
-        Some((idx as usize, off))
+        Some((idx as usize, off as usize + (addr & (PAGE - 1)) as usize))
     }
 
     /// Recompute aliases from the MMAP windows. Called when the firmware programs one.
@@ -2158,6 +2154,16 @@ impl Memory {
         for e in self.fast.iter_mut() {
             *e = FastPage::EMPTY;
         }
+    }
+
+    /// Whether the resolution cache already holds a readable region for `addr`'s page. Read-only
+    /// and side-effect free, so it can stand in for a walk over the regions where a hit is enough
+    /// to answer "is this mapped".
+    #[inline]
+    fn fast_hit(&self, addr: u32) -> bool {
+        let page = addr & !(PAGE - 1);
+        let e = &self.fast[((page >> 12) as usize) & (FAST_SLOTS - 1)];
+        e.tag == page && e.r != u32::MAX
     }
 
     fn locate(&mut self, addr: u32) -> Option<(&mut [u8], usize)> {
@@ -2602,6 +2608,9 @@ impl Bus for Memory {
     }
 
     fn read8(&mut self, addr: u32) -> u8 {
+        if let Some((idx, off)) = self.plain_read(addr) {
+            return self.regions[idx].data[off];
+        }
         // Account for the access before any device model can return early. Doing this further down
         // meant every modelled device — ATA, the BCM, the timers — was invisible to the device
         // report: `ide` showed 8 reads while the drive was handing over a megabyte, and the whole
@@ -2626,6 +2635,46 @@ impl Bus for Memory {
 
     fn write8(&mut self, addr: u32, val: u8) {
         self.write8_inner(addr, val)
+    }
+
+    /// Two byte reads in one resolution; see [`Memory::plain_read`] for when that is the same
+    /// thing. The default is `read8` twice, which is what every other case still does.
+    fn read16(&mut self, addr: u32) -> u16 {
+        let a = addr & !1;
+        if let Some((idx, off)) = self.plain_read(a) {
+            let d = &self.regions[idx].data[off..off + 2];
+            return u16::from_le_bytes([d[0], d[1]]);
+        }
+        u16::from_le_bytes([self.read8(a), self.read8(a.wrapping_add(1))])
+    }
+}
+
+impl Memory {
+    /// The region and offset that answer a read of `addr` when nothing but the backing bytes could
+    /// matter, or `None` when the byte path has to run.
+    ///
+    /// **This is the byte path's own answer, found without walking it.** For a page
+    /// [`Memory::page_is_plain`] passed, `read8` does `count` (a no-op unless one of the four
+    /// instruments below is armed), `read8_inner` (no device window overlaps the page, which is
+    /// what `page_is_plain` established, so it falls through to `locate`) and a read of the first
+    /// region holding the address, which is the region [`Memory::fast_region`] caches. The two
+    /// word-granular core registers are the one thing `read8_inner` answers ahead of the windows,
+    /// so they are asked first, exactly as `read32_via` asks them. A halfword never straddles a
+    /// word, so one answer serves both of its bytes.
+    ///
+    /// Instruction fetch in Thumb state is a `read16` and a byte load is a `read8`; before this
+    /// each was a walk over the alias list, ten device windows and the region list, per byte.
+    #[inline]
+    fn plain_read(&mut self, addr: u32) -> Option<(usize, usize)> {
+        if self.accounting
+            || self.page_log.is_some()
+            || !self.read_addrs.is_empty()
+            || self.input_probe.is_some()
+            || self.core_register(addr & !3).is_some()
+        {
+            return None;
+        }
+        self.fast_region(addr, false)
     }
 }
 
@@ -9709,6 +9758,9 @@ pub fn install_game_stubs(&mut self, exe_stem: &str, o: GameStubs) -> bool {
     /// firmware jumps into the uncached view, so an alias that only worked for loads and stores
     /// would report code as unmapped and stop the run at the first such branch.
     fn is_mapped(&self, addr: u32) -> bool {
+        if self.mem.fast_hit(addr) {
+            return true;
+        }
         let addr = self.mem.translate(addr);
         self.mem
             .regions
