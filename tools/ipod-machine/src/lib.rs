@@ -708,9 +708,10 @@ pub struct Memory {
     /// codec's decoded rate. `None` unless a run asks (`trace --audio-wav=`), and then the FIFO
     /// port is plain backing store and nothing below changes. See [`Memory::enable_audio`].
     pub audio: Option<Audio>,
-    /// Deliver sources whose `CPU_INT_PRIORITY` bit is set as FIQ instead of IRQ. Off, the
-    /// register is plain storage and everything is an IRQ, as it was before this existed; on only
-    /// with [`Memory::enable_audio`], whose DMA completion Rockbox routes that way.
+    /// Deliver sources whose `CPU_INT_PRIORITY` bit is set as FIQ instead of IRQ, and keep
+    /// `CPU_FIQ_STAT` current. Off, both registers are plain storage and everything is an IRQ, as
+    /// it was before this existed; on only with [`Memory::enable_audio`], whose DMA completion
+    /// Rockbox routes that way.
     pub fiq_routing: bool,
     /// The external memory bus controller, when modelled rather than answered with `--rdval`.
     pub xmb: Option<Xmb>,
@@ -7445,6 +7446,9 @@ pub fn install_game_stubs(&mut self, exe_stem: &str, o: GameStubs) -> bool {
         } else {
             0
         };
+        if self.mem.fiq_routing {
+            self.mem.write32(CPU_FIQ_STAT, pending & enabled & prio);
+        }
         if pending & enabled & prio != 0 {
             self.irqs_asserted += 1;
             if self.cpu.fiq() {
@@ -10396,6 +10400,9 @@ pub const PROC_ID: u32 = 0x6000_0000;
 pub const CPU_CTRL: u32 = 0x6000_7000;
 /// A set bit routes that source to the CPU as FIQ. Rockbox's `pp5020.h`.
 pub const CPU_INT_PRIORITY: u32 = 0x6000_402c;
+/// The FIQ source register: the pending, enabled and FIQ-routed sources, rewritten each service
+/// tick while [`Memory::fiq_routing`] is on. A FIQ handler reads it to find the source.
+pub const CPU_FIQ_STAT: u32 = 0x6000_4008;
 /// The sources `CPU_INT_PRIORITY` can route to FIQ here: the audio DMA controller, IRQ 26. RetailOS
 /// also sets the bits of IRQ 27 and the aggregate, and with those routed its boot never lights the
 /// panel (an FIQ storm on the second DMA controller's pending line).

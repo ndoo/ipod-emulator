@@ -375,3 +375,74 @@ fn only_the_audio_dma_source_is_delivered_as_fiq() {
     let (irqs, fiqs) = run_with(26);
     assert!(fiqs > 0 && irqs == 0, "source 26: {irqs} IRQs, {fiqs} FIQs");
 }
+
+/// The stock FIQ handler finds its source by reading `CPU_FIQ_STAT`, not a DMA register.
+#[test]
+fn cpu_fiq_stat_shows_the_routed_audio_dma_source_until_it_is_serviced() {
+    const CPU_FIQ_STAT: u32 = 0x6000_4008;
+    const CPU_INT_EN: u32 = 0x6000_4024;
+    const CPU_INT_DIS: u32 = 0x6000_4028;
+    const CPU_INT_PRIORITY: u32 = 0x6000_402c;
+    const DMA_MASTER: u32 = 0x6000_a000;
+    const DMA0_CMD: u32 = 0x6000_b000;
+    const DMA0_STATUS: u32 = 0x6000_b004;
+    const AUDIO_DMA: u32 = 1 << 26;
+
+    let mut m = machine(&[0; 16]);
+    m.mem
+        .enable_audio(out_path("fiq-stat.wav"), Wm8758::DEFAULT_MCLK_HZ);
+    m.cpu.cpsr.0 |= 0xc0;
+    m.mem.write32(DMA_MASTER, 1 << 31);
+    m.mem.write32(DMA0_CMD, 1 << 30);
+    m.mem.write32(DMA0_STATUS, 1 << 30);
+    m.mem.write32(CPU_INT_EN, AUDIO_DMA);
+
+    // Pending and enabled, but not routed: the source is an IRQ, not an FIQ.
+    m.service_interrupts();
+    assert_eq!(m.mem.read32(CPU_FIQ_STAT), 0);
+
+    m.mem.write32(CPU_INT_PRIORITY, AUDIO_DMA);
+    m.service_interrupts();
+    assert_eq!(m.mem.read32(CPU_FIQ_STAT), AUDIO_DMA);
+
+    // Level: it stays while the completion is unacknowledged.
+    m.service_interrupts();
+    assert_eq!(m.mem.read32(CPU_FIQ_STAT), AUDIO_DMA);
+
+    // Not enabled.
+    m.mem.write32(CPU_INT_DIS, AUDIO_DMA);
+    m.service_interrupts();
+    assert_eq!(m.mem.read32(CPU_FIQ_STAT), 0);
+    m.mem.write32(CPU_INT_EN, AUDIO_DMA);
+    m.service_interrupts();
+    assert_eq!(m.mem.read32(CPU_FIQ_STAT), AUDIO_DMA);
+
+    // Serviced: reading DMA0_STATUS clears the completion latch and the line drops.
+    assert_ne!(m.mem.read32(DMA0_STATUS) & (1 << 30), 0);
+    m.service_interrupts();
+    assert_eq!(m.mem.read32(CPU_FIQ_STAT), 0);
+
+    // A new completion, then the source is routed back to IRQ.
+    m.mem.write32(DMA0_STATUS, 1 << 30);
+    m.service_interrupts();
+    assert_eq!(m.mem.read32(CPU_FIQ_STAT), AUDIO_DMA);
+    m.mem.write32(CPU_INT_PRIORITY, 0);
+    m.service_interrupts();
+    assert_eq!(m.mem.read32(CPU_FIQ_STAT), 0);
+}
+
+/// With the sink off the register is backing store, as it was before the model wrote it.
+#[test]
+fn cpu_fiq_stat_is_left_alone_with_the_sink_off() {
+    let mut m = machine(&[0; 16]);
+    m.cpu.cpsr.0 |= 0xc0;
+    m.mem.write32(0x6000_4008, 0x1234_5678);
+    m.mem.write32(0x6000_a000, 1 << 31);
+    m.mem.write32(0x6000_b000, 1 << 30);
+    m.mem.write32(0x6000_b004, 1 << 30);
+    m.mem.write32(0x6000_4024, 1 << 26);
+    m.mem.write32(0x6000_402c, 1 << 26);
+    m.service_interrupts();
+    assert!(!m.mem.fiq_routing);
+    assert_eq!(m.mem.read32(0x6000_4008), 0x1234_5678);
+}
