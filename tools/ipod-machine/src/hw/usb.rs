@@ -25,6 +25,8 @@ pub const R28: u32 = 0x7000_0028;
 pub const R2C: u32 = 0x7000_002c;
 pub const R60: u32 = 0x7000_0060;
 const DEV_USB0: u32 = 1 << 3;
+/// The enable the stock firmware sets for the controller (bit 22) when it attaches.
+const DEV_USB1: u32 = 1 << 22;
 const INIT_USB: u32 = 1 << 31;
 
 /// GPIO L, bit 4: 5 V on the connector.
@@ -141,6 +143,14 @@ pub struct Config {
     pub full_speed: bool,
     /// The port stays disconnected until the PP5022 PHY sequence has been seen.
     pub strict_phy: bool,
+    /// Simulated microseconds one bulk or control packet takes on a pipe. Zero completes a
+    /// packet whenever the host asks; with a value, a pipe answers NAK until the interval since
+    /// its last packet has passed, so the device's software runs between the packets of a transfer
+    /// (the descriptors of a chain retire one packet at a time, over time).
+    pub slow_us: u32,
+    /// The Nth transfer primed on endpoint 1 IN (pipe 3) is never answered: every IN token of it
+    /// times out until the pipe is flushed, the controller reset or the bus reset. Zero is off.
+    pub deaf: u32,
 }
 
 impl Default for Config {
@@ -149,6 +159,8 @@ impl Default for Config {
             endpoints: 4,
             full_speed: false,
             strict_phy: false,
+            slow_us: 0,
+            deaf: 0,
         }
     }
 }
@@ -215,6 +227,10 @@ pub struct Usb {
     ctrl: [u32; 16],
     tog: [[bool; 2]; 16],
     pipes: [Pipe; 32],
+    /// The time at which a pipe may carry its next packet (`Config::slow_us`).
+    ready_at: [u32; 32],
+    in_primes: u32,
+    deaf: bool,
     cable: bool,
     present: bool,
     speed: u8,
@@ -264,6 +280,9 @@ impl Usb {
             ctrl: [0; 16],
             tog: [[false; 2]; 16],
             pipes: [Pipe::default(); 32],
+            ready_at: [0; 32],
+            in_primes: 0,
+            deaf: false,
             cable: false,
             present: false,
             speed: 2,
@@ -298,7 +317,7 @@ impl Usb {
     }
 
     fn clock_on(&self) -> bool {
-        self.dev_en & DEV_USB0 != 0 && self.dev_init2 & INIT_USB != 0
+        self.dev_en & (DEV_USB0 | DEV_USB1) != 0 && self.dev_init2 & INIT_USB != 0
     }
 
     fn running(&self) -> bool {
@@ -338,6 +357,7 @@ impl Usb {
         self.complete = 0;
         self.nak = 0;
         self.nak_en = 0;
+        self.deaf = false;
         self.ctrl = [0; 16];
         self.ctrl[0] = EP0_RESET;
         self.tog = [[false; 2]; 16];
@@ -353,6 +373,7 @@ impl Usb {
         self.setupstat = 0;
         self.stat = 0;
         self.complete = 0;
+        self.deaf = false;
         self.tog = [[false; 2]; 16];
         self.pipes = [Pipe::default(); 32];
     }
@@ -579,6 +600,12 @@ impl Usb {
                         self.stats.primes += 1;
                         if !self.prime_pipe(dma, pipe) {
                             self.stats.prime_refused += 1;
+                        } else if pipe == 3 {
+                            self.in_primes += 1;
+                            if self.cfg.deaf != 0 && self.in_primes == self.cfg.deaf {
+                                self.note("endpoint 1 IN: deaf from this prime".into());
+                                self.deaf = true;
+                            }
                         }
                     }
                 }
@@ -588,6 +615,9 @@ impl Usb {
                 for pipe in 0..(2 * self.cfg.endpoints as usize) {
                     if v & bit_of(pipe) != 0 {
                         self.stat &= !bit_of(pipe);
+                        if pipe == 3 {
+                            self.deaf = false;
+                        }
                     }
                 }
             }
@@ -645,7 +675,7 @@ impl Usb {
             DEV_RS => {
                 let rose = val & !self.dev_rs;
                 self.dev_rs = val;
-                if rose & DEV_USB0 != 0 {
+                if rose & (DEV_USB0 | DEV_USB1) != 0 {
                     self.controller_reset("DEV_RS");
                     let changed = self.refresh_present();
                     self.notify_if_changed(changed);
@@ -857,6 +887,17 @@ impl Usb {
 
     // ---------------------------------------------------------------- the bus
 
+    /// A pipe that carried a packet less than `slow_us` ago is not ready for another.
+    fn pipe_busy(&self, pipe: usize) -> bool {
+        self.cfg.slow_us != 0 && self.now.wrapping_sub(self.ready_at[pipe]) >= 0x8000_0000
+    }
+
+    fn packet_sent(&mut self, pipe: usize) {
+        if self.cfg.slow_us != 0 {
+            self.ready_at[pipe] = self.now.wrapping_add(self.cfg.slow_us);
+        }
+    }
+
     fn note_nak(&mut self, ep: usize, dir: usize) {
         let st = self.stat;
         self.note(format!("nak ep {ep} dir {dir} stat {st:#x}"));
@@ -918,7 +959,7 @@ impl Usb {
             return self.result(f.ep, usbbus::STALL);
         }
         let pipe = 2 * ep;
-        if self.stat & bit_of(pipe) == 0 {
+        if self.stat & bit_of(pipe) == 0 || self.pipe_busy(pipe) {
             self.stats.out_nak += 1;
             self.note_nak(ep, 0);
             return self.result(f.ep, usbbus::NAK);
@@ -946,6 +987,7 @@ impl Usb {
             return self.result(f.ep, usbbus::ACK);
         }
         self.tog[ep][0] = !self.tog[ep][0];
+        self.packet_sent(pipe);
         let pp = &mut self.pipes[pipe];
         pp.done += len;
         pp.rem -= len;
@@ -970,7 +1012,11 @@ impl Usb {
             return self.result(f.ep, usbbus::STALL);
         }
         let pipe = 2 * ep + 1;
-        if self.stat & bit_of(pipe) == 0 {
+        if self.deaf && pipe == 3 && self.stat & bit_of(pipe) != 0 {
+            self.stats.timeouts += 1;
+            return self.result(f.ep, usbbus::TIMEOUT);
+        }
+        if self.stat & bit_of(pipe) == 0 || self.pipe_busy(pipe) {
             self.stats.in_nak += 1;
             self.note_nak(ep, 1);
             return self.result(f.ep, usbbus::NAK);
@@ -999,6 +1045,7 @@ impl Usb {
         };
         let toggle = self.tog[ep][1];
         self.tog[ep][1] = !toggle;
+        self.packet_sent(pipe);
         let pp = &mut self.pipes[pipe];
         pp.done += n;
         pp.rem -= n;
@@ -1343,6 +1390,85 @@ mod tests {
         assert_eq!(tok >> 16 & 0x7fff, 0);
         inf.flags = 0;
         assert_eq!(u.handle(&mut ram, inf).unwrap().aux, usbbus::NAK);
+    }
+
+    #[test]
+    fn slow_mode_carries_one_packet_per_interval_and_the_tripwire_clears_on_a_retire() {
+        let mut u = Usb::new(Config {
+            slow_us: 100,
+            ..Config::default()
+        });
+        let mut ram = Ram(vec![0; 0x10000]);
+        u.glue(DEV_EN, DEV_USB0);
+        u.glue(DEV_INIT2, INIT_USB);
+        w32(&mut u, &mut ram, USBCMD, CMD_RST);
+        w32(&mut u, &mut ram, USBMODE, 2);
+        w32(&mut u, &mut ram, ENDPOINTLISTADDR, 0x800);
+        w32(&mut u, &mut ram, USBCMD, CMD_RS);
+        u.set_cable(true);
+        reset_host(&mut u, &mut ram);
+        enable(&mut u, &mut ram, 1, false, true);
+        // pipe 3 (endpoint 1 IN): 512 bytes without IOC, then a zero-length descriptor with IOC
+        set_qh(&mut ram, 0x800 + 3 * 64, 512, 0x1000);
+        put_td(&mut ram, 0x1000, 0x1020, 512, false, 0x2000);
+        put_td(&mut ram, 0x1020, 1, 0, true, 0x3000);
+        w32(&mut u, &mut ram, ENDPTPRIME, 1 << 17);
+        assert_eq!(r32(&mut u, ENDPTSTAT), 1 << 17);
+        w32(&mut u, &mut ram, USBCMD, CMD_RS | CMD_ATDTW);
+        assert_eq!(r32(&mut u, USBCMD) & CMD_ATDTW, CMD_ATDTW);
+
+        u.service(20_000, &mut ram);
+        let mut inf = Frame::new(usbbus::IN);
+        inf.ep = 0x81;
+        let r = u.handle(&mut ram, inf.clone()).unwrap();
+        assert_eq!((r.aux, r.data.len()), (usbbus::ACK, 512));
+        assert_eq!(r32(&mut u, ENDPTCOMPLETE), 1 << 17, "the first descriptor sets the bit without IOC");
+        assert_eq!(r32(&mut u, USBSTS) & STS_UI, 0);
+        assert_eq!(r32(&mut u, USBCMD) & CMD_ATDTW, 0, "the next descriptor was loaded");
+        assert_eq!(r32(&mut u, ENDPTSTAT), 1 << 17);
+        assert_eq!(u.handle(&mut ram, inf.clone()).unwrap().aux, usbbus::NAK, "one packet per interval");
+
+        u.service(20_099, &mut ram);
+        assert_eq!(u.handle(&mut ram, inf.clone()).unwrap().aux, usbbus::NAK);
+        u.service(20_100, &mut ram);
+        let r = u.handle(&mut ram, inf).unwrap();
+        assert_eq!((r.aux, r.data.len()), (usbbus::ACK, 0));
+        assert_eq!(r32(&mut u, ENDPTSTAT), 0);
+        assert_eq!(r32(&mut u, USBSTS) & STS_UI, STS_UI);
+    }
+
+    #[test]
+    fn a_deaf_prime_times_out_until_the_pipe_is_flushed_and_primed_again() {
+        let mut u = Usb::new(Config {
+            deaf: 2,
+            ..Config::default()
+        });
+        let mut ram = Ram(vec![0; 0x10000]);
+        u.glue(DEV_EN, DEV_USB0);
+        u.glue(DEV_INIT2, INIT_USB);
+        w32(&mut u, &mut ram, USBCMD, CMD_RST);
+        w32(&mut u, &mut ram, USBMODE, 2);
+        w32(&mut u, &mut ram, ENDPOINTLISTADDR, 0x800);
+        w32(&mut u, &mut ram, USBCMD, CMD_RS);
+        u.set_cable(true);
+        reset_host(&mut u, &mut ram);
+        enable(&mut u, &mut ram, 1, false, true);
+        set_qh(&mut ram, 0x800 + 3 * 64, 512, 0x1000);
+        let mut inf = Frame::new(usbbus::IN);
+        inf.ep = 0x81;
+        for prime in 1..=3u32 {
+            put_td(&mut ram, 0x1000, 1, 8, true, 0x2000);
+            ram.0[(0x800 + 3 * 64 + 8) as usize..][..4].copy_from_slice(&0x1000u32.to_le_bytes());
+            w32(&mut u, &mut ram, ENDPTPRIME, 1 << 17);
+            let r = u.handle(&mut ram, inf.clone()).unwrap();
+            if prime == 2 {
+                assert_eq!(r.aux, usbbus::TIMEOUT, "the second prime is deaf");
+                assert_eq!(u.handle(&mut ram, inf.clone()).unwrap().aux, usbbus::TIMEOUT);
+                w32(&mut u, &mut ram, ENDPTFLUSH, 1 << 17);
+            } else {
+                assert_eq!((r.aux, r.data.len()), (usbbus::ACK, 8), "prime {prime}");
+            }
+        }
     }
 
     #[test]

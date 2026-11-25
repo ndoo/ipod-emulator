@@ -276,7 +276,7 @@ dependencies = [
 
 [[package]]
 name = "arm7tdmi"
-version = "0.5.0"
+version = "0.5.0-rc.1"
 
 [[package]]
 name = "arrayref"
@@ -1156,7 +1156,7 @@ dependencies = [
 
 [[package]]
 name = "docgen"
-version = "0.5.0"
+version = "0.5.0-rc.1"
 
 [[package]]
 name = "downcast-rs"
@@ -1218,7 +1218,7 @@ checksum = "edf234dd1594d6dd434a8fb8cada51ddbbc593e40e4a01556a0b31c62da2775b"
 
 [[package]]
 name = "eapp-inspect"
-version = "0.5.0"
+version = "0.5.0-rc.1"
 
 [[package]]
 name = "either"
@@ -2461,7 +2461,7 @@ dependencies = [
 
 [[package]]
 name = "ipg-player"
-version = "0.5.0"
+version = "0.5.0-rc.1"
 dependencies = [
  "arm7tdmi",
  "ipod-machine",
@@ -2470,7 +2470,7 @@ dependencies = [
 
 [[package]]
 name = "ipod-audio"
-version = "0.5.0"
+version = "0.5.0-rc.1"
 dependencies = [
  "arm7tdmi",
  "cpal",
@@ -2480,7 +2480,7 @@ dependencies = [
 
 [[package]]
 name = "ipod-gui"
-version = "0.5.0"
+version = "0.5.0-rc.1"
 dependencies = [
  "arm7tdmi",
  "block2 0.6.2",
@@ -2500,7 +2500,7 @@ dependencies = [
 
 [[package]]
 name = "ipod-machine"
-version = "0.5.0"
+version = "0.5.0-rc.1"
 dependencies = [
  "arm7tdmi",
 ]

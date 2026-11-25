@@ -50,6 +50,10 @@ attract loop, not somebody playing it**: the wheel script's last event is at 92.
 console is still scrolling in both arms. Whether wheel input reaches the game is untested. See
 [research/06](research/06-rockbox-as-oracle.md) §*"What Doom was waiting for"*.
 
+> **Answered 2026-09-06 (`a63f7f9`), in research/06 §*"Doom is played"*: input reaches the game
+> and drives the player** — when each press is held across one of Doom's button polls after the
+> title is up.
+
 **Not yet fixed by it, but next in line:** `pcm-pp.c`'s `dma_tx_lock`/`dma_tx_unlock` are the same
 pair around a critical section, so audio DMA would have been masked the same way.
 
@@ -78,7 +82,12 @@ font was missing.
 whose content this program can locate has its **declared offset** corrected so the content begins
 `0x200` after it, which is the layout the 5G already has and RetailOS already reads. Offsets are
 rewritten and **bytes are never moved** — shifting five megabytes of payload could overrun the next
-image; `len` shrinks by exactly what `devOffset` gains, so an image still ends where it ended.
+image. `len` is counted from the bundle's own header (`0x800` on 25.1.3, where `osos` is found),
+not from `devOffset`, so it changes only by the difference between that header and the image's
+own: `osos` keeps its length and `rsrc` shortens by `0x600`, and every image still ends where
+Apple's directory ended it. *(Until GitHub PR #47 this said `len` shrinks by the whole shift. That
+cut `rsrc`'s last `0x600` bytes and made its recorded checksum unreproducible, which `install-os`
+reported — issues #43 and #23.)*
 
 ```
 drive built from      what moves                      resets   ata   lit pixels
