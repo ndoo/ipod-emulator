@@ -7825,14 +7825,19 @@ pub fn install_game_stubs(&mut self, exe_stem: &str, o: GameStubs) -> bool {
     /// thread scheduler — would make two runs of the same recipe differ for reasons that have
     /// nothing to do with the firmware.
     ///
-    /// 1 000 is short enough that a spin-wait on the other core resolves promptly and long enough
-    /// that the switching costs nothing measurable.
+    /// 16, because a turn is also how far one core can run while the other stands still, and
+    /// firmware can depend on that being small. RetailOS's coprocessor posts a request to the CPU,
+    /// spins until the CPU marks it done and posts the next; the CPU task that serves them has to
+    /// be waiting again by then. At 1 000 the coprocessor's whole turnaround fits in one turn, the
+    /// next post finds the task still running, and playback never starts. Measured on RetailOS
+    /// 1.3 from Music > Playlists and Music > Songs: it starts at 200 and below and stalls at 250
+    /// and above. The switching costs nothing measurable at 16 or at 1.
     ///
     /// **It is the one number here that corresponds to nothing on the hardware**, where the two
     /// cores run at once rather than in slices — so whether a workload depends on it is a question
     /// to answer by measurement, not by assertion. `--quantum=N` exists to answer it, and
     /// [`Memory::quantum`] is what the scheduler actually reads.
-    pub const QUANTUM: usize = 1_000;
+    pub const QUANTUM: usize = 16;
 
     /// Halted cycles the run loop pays for one at a time before it will consider skipping any.
     ///
