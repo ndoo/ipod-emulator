@@ -113,7 +113,7 @@ hardware here is `0x0C` — the LBA form, equally legitimate — and `vfs.c` has
 
 `ipod-emulator --boot-osos-image=DISK` opens the window and starts the OS in DISK's firmware
 partition (its `osos` entry) at once: the panel, click wheel, buttons and hold switch are live. The
-drive is filed as a device named "NuttX drive" in a scratch data directory (a temp directory, unless
+drive is filed as a device named "Drive OS" in a scratch data directory (a temp directory, unless
 `IPOD_EMULATOR_DATA` is set), so your own library is not touched. It is `trace --osos-from-disk --boot-osos --cold-boot --bcm --no-bcm-registry`
 plus the UART line-status read at `0x70006014` held at `0x60`, with a stub NOR
 (`ipod_machine::nor::stub`: an `flsh` directory with a placeholder `vmcs`) in place of an iPod's

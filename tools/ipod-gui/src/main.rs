@@ -4280,7 +4280,7 @@ fn start_title(
 /// The library name of the device `--boot-osos-image=` files. [`start_machine`] reads it to start
 /// that device as [`emu::BootTarget::DriveOs`] again after it has stopped, since a library device's
 /// own start is the Apple boot.
-const DRIVE_OS_DEVICE: &str = "NuttX drive";
+const DRIVE_OS_DEVICE: &str = "Drive OS";
 
 /// File the drive as a device and make it the current one, for `--boot-osos-image=`.
 ///
@@ -4303,7 +4303,7 @@ fn register_drive_os(s: &mut Settings, disk: &std::path::Path) -> Result<usize, 
             guid: None,
             splash: None,
         }),
-        "NuttX target",
+        "Drive OS target",
         None,
     );
     s.disks.push(Disk {
@@ -11182,7 +11182,7 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// **The window with the real NuttX UI in it.** Skipped loudly without `IPOD_OSOS_IMAGE`, a
+    /// **The window with a third-party OS's UI in it.** Skipped loudly without `IPOD_OSOS_IMAGE`, a
     /// drive built by a third-party OS's tooling that nothing in this repository carries. With it,
     /// the machine really boots on its own thread, the window is ticked until the panel has the
     /// picture, and the window is rasterized to `IPOD_OSOS_SHOT` (a PNG path) if that is set.
