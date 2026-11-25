@@ -7,8 +7,7 @@
 //!
 //! The host end of the bus is a socket (`usbbus`). Frames are taken at the interrupt service tick,
 //! one transaction each, and answered at once. Where the register map left a behaviour open the
-//! generic core's documented one is used, and `docs/hw/emu-usb.md` of the firmware repository lists
-//! each choice.
+//! generic core's documented one is used.
 
 use crate::hw::usbbus::{self, Event, Frame, Link};
 
