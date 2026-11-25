@@ -4356,6 +4356,7 @@ fn start_drive_os(
         ));
     }
     let mut cfg = emu::Config::drive_os(disk.to_path_buf());
+    cfg.audio_live = ipod_audio::AVAILABLE;
     launch.apply(&mut cfg);
 
     let link = emu::Link::new();
