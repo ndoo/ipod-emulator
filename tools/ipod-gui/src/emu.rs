@@ -255,7 +255,8 @@ pub struct Config {
     /// seeds the bare-iPod value `0x08`; this puts the machine back on a wall socket **on purpose**,
     /// which is the only configuration in which there is a charging screen to return to.
     pub charger: bool,
-    /// `--audio-live`: open the host's default audio output and play the codec's output on it.
+    /// Open the host's default audio output and play the codec's output on it. The window sets
+    /// it unless `--no-audio` is given; `--headless=N` sets it only with `--audio`.
     pub audio_live: bool,
     /// `--samples=8,12,16` — where the probe samples the panel, in **millions of instructions**
     /// past the moment it acts. Empty means [`PROBE_SAMPLES`].
@@ -2105,7 +2106,7 @@ pub fn run(cfg: Config, link: Arc<Link>) {
                 Some(AudioOut { device, feeder })
             }
             Err(e) => {
-                eprintln!("audio: {e}; --audio-live is off for this run");
+                eprintln!("audio: {e}; this run has no sound");
                 None
             }
         }
@@ -2154,7 +2155,7 @@ pub fn run(cfg: Config, link: Arc<Link>) {
     }
 }
 
-/// The host audio output of a run started with `--audio-live`.
+/// The host audio output of a run that plays sound.
 struct AudioOut {
     device: ipod_audio::Device,
     feeder: ipod_audio::Feeder,

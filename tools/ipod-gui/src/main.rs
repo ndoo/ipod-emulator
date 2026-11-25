@@ -4449,6 +4449,9 @@ fn start_machine(
     // second so a `--clock=5` beats `ipod_machine::CLOCK` rather than the other way round, and
     // narrow by construction: `Machine::apply` writes five fields and nothing else can reach the
     // config from a command line at all.
+    //
+    // The window plays sound unless the launch says `--no-audio`, where this build has a device.
+    cfg.audio_live = ipod_audio::AVAILABLE;
     launch.apply(&mut cfg);
     // …and §12.5's target over both, because it is the only one of the three that a press just
     // made. `machine_config` writes `BootTarget::Os` and `Machine::apply` does not touch the
@@ -12931,7 +12934,7 @@ pub(crate) mod tests {
         let wiring = wire(
             &w,
             settings.clone(),
-            args::Machine { cold: true, clock: Some(5), cores: Some(true), charger: true, audio_live: false },
+            args::Machine { cold: true, clock: Some(5), cores: Some(true), charger: true, audio: None },
             Rc::new(drops::Shell::Native),
         );
         w.invoke_start_device(0);
