@@ -22,8 +22,10 @@ fn machine() -> Machine {
     m
 }
 
-/// The PLL, divider and power writes that make the codec the 48 kHz I2S master.
+/// The clock select and the PLL, divider and power writes that make the codec the 48 kHz I2S
+/// master, as Rockbox makes them.
 fn clock_codec_at_48k(m: &mut Machine) {
+    m.mem.write32(0x7000_0018, 0);
     for (reg, val) in [
         (0x01u8, 0x02fu16),
         (0x03, 0x00f),
@@ -110,4 +112,48 @@ fn with_the_sink_off_the_fifo_port_is_plain_storage() {
     assert!(m.mem.audio.is_none());
     assert_eq!(m.mem.read32(IISFIFO_WR), 0x1234_5678);
     assert_eq!((m.mem.read32(IISFIFO_CFG) >> 16) & 0x3f, 0);
+}
+
+/// RetailOS's playback-time codec driver: both bytes of a write in one word at the first data
+/// register, with a stale byte left in the second by an earlier transfer.
+#[test]
+fn a_word_stored_to_the_first_i2c_data_register_sends_its_second_byte() {
+    const I2C: u32 = 0x7000_c000;
+    let mut m = machine();
+    m.mem.i2c_base = Some(I2C);
+    m.mem.write8(I2C + 0x10, 0x01);
+    m.mem.write32(I2C + 4, u32::from(Wm8758::ADDR) << 1);
+    m.mem.write32(I2C, 0x02);
+    m.mem.write32(I2C + 0x0c, 0x0000_4d0d);
+    m.mem.write32(I2C, 0x82);
+    assert_eq!(m.mem.wm8758.reg(0x06), Some(0x14d));
+
+    // One byte per register still wins when the second register is stored after the first.
+    m.mem.write8(I2C + 0x0c, 0x68);
+    m.mem.write8(I2C + 0x10, 0x40);
+    m.mem.write8(I2C, 0x82);
+    assert_eq!(m.mem.wm8758.reg(0x34), Some(0x040));
+}
+
+/// RetailOS's 44.1 kHz PLL constants, on the clock select it starts with and on Rockbox's.
+#[test]
+fn the_external_clock_select_halves_the_codec_clock() {
+    let mut m = machine();
+    m.mem.write32(0x7000_0018, 0x0000_0008);
+    m.mem.enable_audio(out_path("ext_clock.wav"), Wm8758::DEFAULT_MCLK_HZ);
+    for (reg, val) in [
+        (0x01u8, 0x02du16),
+        (0x24, 0x007),
+        (0x25, 0x021),
+        (0x26, 0x151),
+        (0x27, 0x1ac),
+        (0x06, 0x14d),
+    ] {
+        m.mem
+            .wm8758
+            .transfer(0x82, [(reg << 1) | (val >> 8) as u8, val as u8, 0, 0]);
+    }
+    assert_eq!(m.mem.audio_rate(), Some(44_100));
+    m.mem.write32(0x7000_0018, 0);
+    assert_eq!(m.mem.audio_rate(), None, "88.2 kHz from 24 MHz is outside the part's range");
 }

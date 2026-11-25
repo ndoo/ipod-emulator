@@ -44,6 +44,10 @@ struct Segment {
 pub struct Audio {
     path: PathBuf,
     pub mclk_hz: f64,
+    /// Bits 3:2 of `0x70000018`, the external clock select: 0 leaves `mclk_hz` on the codec's pin
+    /// and anything else halves it. Rockbox clears the field for 24 MHz and prescales in the PLL;
+    /// RetailOS never stores to it while it runs, and its PLL constants give 44.1 kHz from 12 MHz.
+    ext_clock_sel: u8,
     segments: Vec<Segment>,
     bytes: [u8; 4],
     have: u8,
@@ -66,6 +70,7 @@ impl Audio {
         Self {
             path: path.into(),
             mclk_hz,
+            ext_clock_sel: 0,
             segments: Vec::new(),
             bytes: [0; 4],
             have: 0,
@@ -84,11 +89,18 @@ impl Audio {
         match self.cached {
             Some((at, rate)) if at == codec.writes => rate,
             _ => {
-                let rate = codec.sample_rate(self.mclk_hz);
+                let div = if self.ext_clock_sel == 0 { 1.0 } else { 2.0 };
+                let rate = codec.sample_rate(self.mclk_hz / div);
                 self.cached = Some((codec.writes, rate));
                 rate
             }
         }
+    }
+
+    /// The low byte of `0x70000018` as stored.
+    pub fn ext_clock_byte(&mut self, val: u8) {
+        self.ext_clock_sel = (val >> 2) & 3;
+        self.cached = None;
     }
 
     /// One byte stored at `IISFIFO_WR + off`. `iisconfig` is the register as it stands.

@@ -2000,7 +2000,9 @@ impl Memory {
     /// And [`Memory::fiq_routing`] comes on. Bypass ledger #21; retire it when a retail boot with
     /// the routing on matches one with it off.
     pub fn enable_audio(&mut self, path: impl Into<std::path::PathBuf>, mclk_hz: f64) {
-        self.audio = Some(Audio::new(path, mclk_hz));
+        let mut audio = Audio::new(path, mclk_hz);
+        audio.ext_clock_byte(self.peek(EXT_CLOCK_SEL));
+        self.audio = Some(audio);
         self.fiq_routing = true;
         if !self.read_or_masks.iter().any(|&(at, _)| at == IISFIFO_CFG) {
             self.read_or_masks.push((IISFIFO_CFG, IIS_TX_FREE_EMPTY));
@@ -3516,6 +3518,11 @@ impl Memory {
             self.i2s_fifo_byte(addr - IISFIFO_WR, val);
             return;
         }
+        if addr == EXT_CLOCK_SEL {
+            if let Some(a) = &mut self.audio {
+                a.ext_clock_byte(val);
+            }
+        }
         if let Some(base) = self.mmap_base {
             let off = addr.wrapping_sub(base);
             if off < 0x40 {
@@ -3525,6 +3532,17 @@ impl Memory {
                 self.mmap_regs[w] = u32::from_le_bytes(b);
                 self.rebuild_mmap_aliases();
                 return;
+            }
+        }
+        // A word stored to the first data register carries one outgoing byte per lane. RetailOS's
+        // codec driver stores `reg | val << 8` there and sends two bytes; its boot-time driver and
+        // Rockbox store one byte per register, which this leaves as it was.
+        if let Some(base) = self.i2c_base {
+            let lane = addr.wrapping_sub(base + 0x0c);
+            if (1..4).contains(&lane) {
+                if let Some((buf, i)) = self.locate_write(base + 0x0c + 4 * lane) {
+                    buf[i] = val;
+                }
             }
         }
         // A transfer starts when CTRL's SEND bit is written; sample the request as it goes out.
@@ -10351,6 +10369,8 @@ pub const BACKLIGHT_STEP_USEC: u32 = 100;
 /// times in a 1.7 G boot**, from one PC, first at 111 551 914 — that is initialisation, not a poll,
 /// and `HoldSwitchTask` learns about every later movement from this interrupt. Without it the
 /// emulator moved the pin and told nobody, so the switch was sampled once at boot and never again.
+/// Bits 3:2 choose the clock on the codec's master clock pin. See [`hw::audio::Audio`].
+pub const EXT_CLOCK_SEL: u32 = 0x7000_0018;
 pub const GPIOA_INT_STAT: u32 = 0x6000_d040;
 pub const GPIOA_INT_EN: u32 = 0x6000_d050;
 pub const GPIOA_INT_LEV: u32 = 0x6000_d060;
@@ -11589,7 +11609,11 @@ pub fn map_hardware(m: &mut Machine, cold_boot: bool) {
     //
     // The state modelled is a bare iPod: nothing plugged in, hold off, not charging.
     for (addr, val) in [
-        (0x6000_d030u32, 0x0000_0020u32), // GPIOA: hold OFF, no headphones
+        // GPIOA: hold OFF, no headphones. Bit 3 is set because RetailOS 1.3 reads it 137 ms into
+        // its start and, finding it clear, puts the codec to sleep and writes the system reset bit.
+        (0x6000_d030u32, 0x0000_0028u32),
+        // The external clock select as RetailOS finds it: the codec's clock at 12 MHz.
+        (EXT_CLOCK_SEL, 0x0000_0008),
         (0x6000_d034, 0x0000_0001),       // GPIOB: not charging
         // GPIOL: bit 3 SET — no main/FireWire charger; bit 4 clear — no USB charger.
         //
