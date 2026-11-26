@@ -161,6 +161,8 @@ fn image(p: &Plan) -> Vec<u8> {
 fn machine(img: &[u8]) -> Machine {
     let mut m = Machine::new(&EApp::none(), 0x1100_0000, 0x0100_0000);
     map_hardware(&mut m, false);
+    // Rockbox's clock select: 24 MHz on the codec's pin, which its PLL constants are for.
+    m.mem.write32(0x7000_0018, 0);
     m.mem.i2c_base = Some(0x7000_c000);
     for (i, b) in img.iter().enumerate() {
         m.mem.write8(i as u32, *b);

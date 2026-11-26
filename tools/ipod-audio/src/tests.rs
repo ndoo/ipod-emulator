@@ -292,6 +292,8 @@ fn frames_stored_to_the_i2s_fifo_come_out_of_the_callback_scaled_by_the_codec() 
 
     let mut m = Machine::new(&EApp::none(), 0x1100_0000, 0x0100_0000);
     map_hardware(&mut m, false);
+    // Rockbox's clock select: 24 MHz on the codec's pin.
+    m.mem.write32(0x7000_0018, 0);
     m.mem.enable_audio_live(Wm8758::DEFAULT_MCLK_HZ);
     // The 44.1 kHz bring-up, then the 80% volume: DAC 255, OUT1 39, which is -18 dB.
     let put = |m: &mut Machine, reg: u8, val: u16| {
